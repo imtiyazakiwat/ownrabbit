@@ -152,7 +152,7 @@ describe("runReviewPipeline", () => {
     const state = fakeState();
     const result = await runReviewPipeline(deps({ github: gh.port, state }));
 
-    expect(result).toEqual({ status: "completed", filesReviewed: 1, findingsRaw: 1, commentsPosted: 1 });
+    expect(result).toEqual({ status: "completed", filesReviewed: 1, findingsRaw: 1, commentsPosted: 1, failedPasses: 0 });
     expect(gh.summaries[0]).toContain("Adds q()");
     const review = gh.reviews[0]!;
     expect(review.commitId).toBe(HEAD);
@@ -226,13 +226,38 @@ describe("runReviewPipeline", () => {
     expect(result).toMatchObject({ status: "completed", filesReviewed: 1 });
   });
 
-  it("survives a single reviewer failure but not all of them", async () => {
+  it("fails the job only when every reviewer pass fails", async () => {
     const multi = settings({ reviewers: ["security", "bugs"] });
-    const failSecurity = fakeLlm({ fail: /focus: security/ });
-    expect((await runReviewPipeline(deps({ llm: failSecurity, settings: multi }))).status).toBe("completed");
-
     const failAll = fakeLlm({ fail: /Your focus/ });
     await expect(runReviewPipeline(deps({ llm: failAll, settings: multi }))).rejects.toThrow("All reviewers failed");
+  });
+
+  it("marks a review partial, says so on the PR, and does not advance the incremental cursor", async () => {
+    const gh = fakeGitHub();
+    const state = fakeState(OLD);
+    const multi = settings({ reviewers: ["security", "bugs"] });
+    const llm = fakeLlm({ fail: /focus: correctness/ });
+    const result = await runReviewPipeline(deps({ llm, github: gh.port, state, settings: multi }));
+
+    expect(result).toMatchObject({ status: "completed", failedPasses: 1 });
+    const body = gh.reviews[0]!.body;
+    expect(body).toContain("Partial review");
+    expect(body).toContain("1 of 2 reviewer passes failed");
+    expect(state.saved.every((s) => (s as { lastReviewedSha?: string }).lastReviewedSha === undefined)).toBe(true);
+  });
+
+  it("retries a transiently failing reviewer pass once", async () => {
+    let calls = 0;
+    const llm = fakeLlm();
+    const base = llm.chatJson.bind(llm);
+    llm.chatJson = async (options, schema) => {
+      if (options.messages[0]!.content.includes("Your focus") && calls++ === 0) throw new Error("502 upstream");
+      return base(options, schema);
+    };
+    const gh = fakeGitHub();
+    const result = await runReviewPipeline(deps({ llm, github: gh.port }));
+    expect(result).toMatchObject({ status: "completed", failedPasses: 0, commentsPosted: 1 });
+    expect(gh.reviews[0]!.body).not.toContain("Partial review");
   });
 
   it("quick depth never creates a workspace", async () => {

@@ -67,6 +67,9 @@ export interface ReviewStats {
   posted: Finding[];
   /** Findings that could not be anchored as inline comments. */
   unplaced: Finding[];
+  /** Reviewer passes (reviewer × file batch) that failed even after retry. */
+  failedPasses: number;
+  totalPasses: number;
 }
 
 export function renderReviewBody(stats: ReviewStats, mention: string): string {
@@ -82,12 +85,20 @@ export function renderReviewBody(stats: ReviewStats, mention: string): string {
       ? `commits \`${stats.baseSha.slice(0, 7)}\`..\`${stats.headSha.slice(0, 7)}\``
       : `commit \`${stats.headSha.slice(0, 7)}\``;
 
-  const lines = [
-    reviewMarker(stats.headSha),
-    `**OwnRabbit review** of ${range}`,
-    "",
-    tally,
-  ];
+  // Never claim "no issues" when part of the review didn't run.
+  const partial = stats.failedPasses > 0;
+  const headline = partial && stats.posted.length === 0 ? "No issues found in the parts that were reviewed." : tally;
+
+  const lines = [reviewMarker(stats.headSha), `**OwnRabbit review** of ${range}`, "", headline];
+
+  if (partial) {
+    lines.push(
+      "",
+      `> [!WARNING]`,
+      `> **Partial review.** ${stats.failedPasses} of ${stats.totalPasses} reviewer passes failed because the model was unavailable. ` +
+        `Comment \`${mention} full review\` to retry.`,
+    );
+  }
 
   if (stats.unplaced.length > 0) {
     lines.push("", "<details><summary>Findings outside the diff</summary>", "");
