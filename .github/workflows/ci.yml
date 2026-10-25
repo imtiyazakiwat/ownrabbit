@@ -72,8 +72,13 @@ jobs:
         id: deploy
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        # In CI the CLI may print a multi-line JSON result instead of a bare URL, and multi-line text
+        # breaks GITHUB_OUTPUT. Pull out the deployment URL either way; a failed deploy exits non-zero first.
         run: |
-          url=$(vercel deploy --prod --yes --non-interactive)
+          set -o pipefail
+          vercel deploy --prod --yes | tee deploy.out
+          url=$(grep -oE 'https://[a-z0-9-]+\.vercel\.app' deploy.out | grep -v '^https://ownrabbit\.vercel\.app$' | head -n 1)
+          if [ -z "$url" ]; then echo "::error::No deployment URL in vercel output"; exit 1; fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "Deployed $url" >> "$GITHUB_STEP_SUMMARY"
       - name: Smoke test
