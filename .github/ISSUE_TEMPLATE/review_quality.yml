@@ -1,0 +1,32 @@
+name: Review quality
+description: OwnRabbit posted a wrong, noisy, or missing finding
+labels: ["review-quality"]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What happened?
+      options:
+        - False positive (finding was wrong)
+        - Noise (correct but not worth posting)
+        - Missed issue (should have been caught)
+        - Bad suggestion (fix doesn't apply or is wrong)
+    validations:
+      required: true
+  - type: input
+    id: link
+    attributes:
+      label: Link to the comment or PR
+      description: Public repos only. For private repos, paste a minimal snippet below instead.
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: The code involved and what the correct review would have been.
+    validations:
+      required: true
+  - type: input
+    id: settings
+    attributes:
+      label: Depth and reviewers
+      placeholder: standard · security, bugs, performance
