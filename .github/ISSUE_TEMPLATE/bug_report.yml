@@ -1,0 +1,42 @@
+name: Bug report
+description: Something in OwnRabbit doesn't work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For **security issues**, please use [private reporting](https://github.com/imtiyazakiwat/ownrabbit/security/advisories/new) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open a PR that ...
+        2. Comment `@ownrabbit review`
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Review quality (wrong / noisy / missing findings)
+        - Dashboard / settings
+        - GitHub integration (webhook, comments, suggestions)
+        - Self-hosting / deployment
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      render: text

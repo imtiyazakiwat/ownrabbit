@@ -14,5 +14,3 @@ coverage/
 *.pem
 .secrets/
 service-account*.json
-.vercel
-.env*

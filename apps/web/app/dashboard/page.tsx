@@ -1,29 +1,65 @@
-import { DEPTH_PROFILES, resolveSettings } from "@ownrabbit/core";
-import Link from "next/link";
+import { resolveSettings } from "@ownrabbit/core";
+import { Suspense } from "react";
 import { GitHubMark } from "@/components/brand";
-import { listAccessibleRepos, loadRepoDocs } from "@/lib/access";
+import { listAccessibleRepos, loadLastReviews, loadRepoDocs } from "@/lib/access";
 import { getSession } from "@/lib/session";
+import { RepoList, type RepoRow } from "./repo-list";
 
 export const dynamic = "force-dynamic";
 
-const TRIGGER_LABEL = { auto: "auto", mention: "@mention", both: "auto + @mention" } as const;
+export const metadata = { title: "Repositories" };
 
 export default async function Dashboard() {
   const session = (await getSession())!;
   const appSlug = process.env.GITHUB_APP_SLUG ?? "ownrabbit";
-  const repos = await listAccessibleRepos(session).catch(() => null);
-  const docs = repos ? await loadRepoDocs(repos.map((r) => r.repoId)) : new Map();
+  const repos = await listAccessibleRepos(session).catch((err) => {
+    console.error("listAccessibleRepos failed", err);
+    return null;
+  });
+
+  const ids = repos?.map((r) => r.repoId) ?? [];
+  const [docs, lastReviews] = await Promise.all([loadRepoDocs(ids), loadLastReviews(ids)]);
+
+  const rows: RepoRow[] = (repos ?? []).map((repo) => {
+    const doc = docs.get(repo.repoId);
+    const settings = resolveSettings(doc?.settings);
+    return {
+      repoId: repo.repoId,
+      fullName: repo.fullName,
+      owner: repo.owner,
+      name: repo.name,
+      ownerAvatar: repo.ownerAvatar,
+      private: repo.private,
+      canEdit: repo.canEdit,
+      description: repo.description,
+      language: repo.language,
+      pushedAt: repo.pushedAt,
+      enabled: settings.enabled && doc?.active !== false,
+      trigger: settings.trigger,
+      depth: settings.depth,
+      reviewerCount: settings.reviewers.length,
+      lastReview: lastReviews.get(repo.repoId) ?? null,
+    };
+  });
+
+  const enabled = rows.filter((r) => r.enabled).length;
+  const reviewed = rows.filter((r) => r.lastReview).length;
 
   return (
-    <main className="pt-12">
+    <main className="pt-10">
       <div className="flex flex-wrap items-end justify-between gap-6">
         <div>
-          <p className="text-xs uppercase tracking-[0.3em] text-carrot">Repositories</p>
+          <p className="text-xs tracking-[0.3em] text-carrot uppercase">Repositories</p>
           <h1 className="mt-2 font-display text-4xl">Where the rabbit reads</h1>
+          {repos && repos.length > 0 && (
+            <p className="mt-2 text-sm text-muted">
+              {enabled} of {rows.length} enabled · {reviewed} reviewed at least once
+            </p>
+          )}
         </div>
         <a
           href={`https://github.com/apps/${appSlug}/installations/new`}
-          className="inline-flex items-center gap-2 border border-line px-4 py-2 text-sm hover:border-paper"
+          className="inline-flex items-center gap-2 bg-carrot px-4 py-2 text-sm font-semibold text-ink transition hover:bg-paper"
         >
           <GitHubMark /> Add repositories
         </a>
@@ -43,35 +79,10 @@ export default async function Dashboard() {
           <p className="mt-2 text-muted">Install the GitHub App on a repository and it will show up here.</p>
         </div>
       ) : (
-        <ul className="mt-10 divide-y divide-line border-y border-line">
-          {repos.map((repo, i) => {
-            const doc = docs.get(repo.repoId);
-            const settings = resolveSettings(doc?.settings);
-            const enabled = settings.enabled && doc?.active !== false;
-            return (
-              <li key={repo.repoId} className="rise" style={{ animationDelay: `${Math.min(i, 12) * 30}ms` }}>
-                <Link
-                  href={`/dashboard/${repo.repoId}`}
-                  className="group grid items-center gap-2 py-4 md:grid-cols-[1fr_auto_auto_auto] md:gap-8"
-                >
-                  <span className="flex items-center gap-3">
-                    <span
-                      aria-label={enabled ? "enabled" : "disabled"}
-                      className={`h-2 w-2 rounded-full ${enabled ? "bg-add" : "bg-dim"}`}
-                    />
-                    <span className="font-display text-lg group-hover:text-carrot">{repo.fullName}</span>
-                    {repo.private && <span className="border border-line px-1.5 text-[10px] text-muted">private</span>}
-                  </span>
-                  <span className="text-xs text-muted">{TRIGGER_LABEL[settings.trigger]}</span>
-                  <span className="text-xs text-muted">
-                    {DEPTH_PROFILES[settings.depth].label} · {settings.reviewers.length} reviewers
-                  </span>
-                  <span className="text-xs text-dim group-hover:text-carrot">{repo.canEdit ? "configure →" : "view →"}</span>
-                </Link>
-              </li>
-            );
-          })}
-        </ul>
+        // useSearchParams requires a Suspense boundary.
+        <Suspense>
+          <RepoList repos={rows} />
+        </Suspense>
       )}
     </main>
   );

@@ -12,6 +12,17 @@ export interface AccessibleRepo {
   private: boolean;
   /** Admin/maintain users can change settings; others get read-only. */
   canEdit: boolean;
+  description: string | null;
+  language: string | null;
+  pushedAt: string | null;
+  ownerAvatar: string;
+}
+
+export interface LastReview {
+  prNumber: number;
+  status: string;
+  commentsPosted?: number;
+  createdAtMs?: number;
 }
 
 /**
@@ -40,6 +51,10 @@ export async function listAccessibleRepos(session: Session): Promise<AccessibleR
         name: repo.name,
         private: repo.private,
         canEdit: Boolean(perms?.admin || perms?.maintain),
+        description: repo.description ?? null,
+        language: repo.language ?? null,
+        pushedAt: repo.pushed_at ?? null,
+        ownerAvatar: repo.owner.avatar_url,
       });
     }
   }
@@ -49,6 +64,32 @@ export async function listAccessibleRepos(session: Session): Promise<AccessibleR
 export async function findAccessibleRepo(session: Session, repoId: number): Promise<AccessibleRepo | undefined> {
   if (!Number.isSafeInteger(repoId) || repoId <= 0) return undefined;
   return (await listAccessibleRepos(session)).find((r) => r.repoId === repoId);
+}
+
+/** Most recent review per repo. One indexed query per repo, run in parallel. */
+export async function loadLastReviews(repoIds: number[]): Promise<Map<number, LastReview>> {
+  const out = new Map<number, LastReview>();
+  const results = await Promise.allSettled(
+    repoIds.map(async (repoId) => {
+      const snap = await db()
+        .collection(collections.reviews)
+        .where("repoId", "==", repoId)
+        .orderBy("createdAt", "desc")
+        .limit(1)
+        .get();
+      const data = snap.docs[0]?.data();
+      if (!data) return;
+      out.set(repoId, {
+        prNumber: data.prNumber,
+        status: data.status,
+        commentsPosted: data.commentsPosted,
+        createdAtMs: data.createdAt?.toMillis?.(),
+      });
+    }),
+  );
+  // A rejected lookup just means "no last review" for that repo.
+  for (const r of results) if (r.status === "rejected") console.error("last review lookup failed", r.reason);
+  return out;
 }
 
 export async function loadRepoDocs(repoIds: number[]): Promise<Map<number, RepoDoc>> {

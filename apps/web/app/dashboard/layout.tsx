@@ -7,7 +7,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
   if (!session) redirect("/api/auth/login");
 
   return (
-    <div className="mx-auto max-w-6xl px-6 pb-24">
+    <div className="mx-auto max-w-[88rem] px-6 pb-24">
       <header className="flex items-center justify-between border-b border-line py-5">
         <Logo />
         <div className="flex items-center gap-4 text-sm">

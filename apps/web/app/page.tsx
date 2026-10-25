@@ -2,6 +2,8 @@ import Link from "next/link";
 import { GitHubMark, Logo } from "@/components/brand";
 import { getSession } from "@/lib/session";
 
+const REPO = "https://github.com/imtiyazakiwat/ownrabbit";
+
 const STAGES = [
   { n: "01", name: "Triage", text: "A fast model maps the PR, ranks files by risk, and skips the noise: lockfiles, generated code, assets." },
   { n: "02", name: "Specialists", text: "Security, correctness, performance, maintainability, and test reviewers run in parallel, each with its own brief." },
@@ -27,8 +29,11 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ e
       <header className="flex items-center justify-between py-6">
         <Logo />
         <nav className="flex items-center gap-6 text-sm text-muted">
-          <a href="https://github.com/imtiyazakiwat/ownrabbit" className="hover:text-paper">
-            Source
+          <a href={`${REPO}/blob/main/docs/self-hosting.md`} className="hidden hover:text-paper sm:inline">
+            Self-host
+          </a>
+          <a href={REPO} className="inline-flex items-center gap-1.5 hover:text-paper">
+            <GitHubMark /> GitHub
           </a>
           {session ? (
             <Link href="/dashboard" className="text-paper hover:text-carrot">
@@ -116,8 +121,48 @@ export default async function Home({ searchParams }: { searchParams: Promise<{ e
         </dl>
       </section>
 
-      <footer className="mt-32 flex flex-wrap items-center justify-between gap-4 border-t border-line pt-6 text-xs text-dim">
-        <span>OwnRabbit: built in the open.</span>
+      <section className="mt-32 border border-line bg-ink-2 p-8 md:p-12">
+        <div className="grid gap-10 md:grid-cols-[1.2fr_1fr] md:items-center">
+          <div>
+            <p className="text-xs tracking-[0.3em] text-carrot uppercase">Open source</p>
+            <h2 className="mt-3 font-display text-3xl md:text-4xl">
+              Read the prompts. <em className="text-muted">Change them.</em>
+            </h2>
+            <p className="mt-4 max-w-md text-muted">
+              Every prompt, rule, and pipeline stage is in the repository. Run it on your own cloud, point it at your own
+              model, and send a PR when you make it better.
+            </p>
+          </div>
+          <div className="grid gap-2 text-sm">
+            <a href={REPO} className="group flex items-center justify-between border border-line px-4 py-3 hover:border-carrot">
+              <span className="flex items-center gap-3">
+                <GitHubMark /> Star on GitHub
+              </span>
+              <span className="text-dim group-hover:text-carrot">↗</span>
+            </a>
+            <a href={`${REPO}/blob/main/docs/self-hosting.md`} className="group flex items-center justify-between border border-line px-4 py-3 hover:border-carrot">
+              <span>Self-hosting guide</span>
+              <span className="text-dim group-hover:text-carrot">↗</span>
+            </a>
+            <a href={`${REPO}/blob/main/CONTRIBUTING.md`} className="group flex items-center justify-between border border-line px-4 py-3 hover:border-carrot">
+              <span>Contributing</span>
+              <span className="text-dim group-hover:text-carrot">↗</span>
+            </a>
+          </div>
+        </div>
+      </section>
+
+      <footer className="mt-16 flex flex-wrap items-center justify-between gap-4 border-t border-line pt-6 text-xs text-dim">
+        <span>
+          OwnRabbit: built in the open ·{" "}
+          <a href={`${REPO}/issues`} className="hover:text-carrot">
+            issues
+          </a>{" "}
+          ·{" "}
+          <a href={`${REPO}/security/advisories/new`} className="hover:text-carrot">
+            security
+          </a>
+        </span>
         <span className="caret">
           comment <span className="text-paper">@{appSlug} review</span> on any PR
         </span>
