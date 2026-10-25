@@ -25,6 +25,7 @@ import {
 } from "./publish";
 import { runReviewer, type ReviewContext, type ReviewFile } from "./reviewer";
 import type { Workspace } from "./repo";
+import type { RunLog } from "./runlog";
 
 // ------------------------------------------------------------------ ports
 
@@ -72,6 +73,14 @@ export interface PipelineDeps {
   mention: string;
   signal?: AbortSignal;
   log: (msg: string, extra?: Record<string, unknown>) => void;
+  /**
+   * Time budget for the reviewer phase. When it runs out, unfinished passes
+   * count as failed and the pipeline still publishes a partial review,
+   * instead of the whole job hitting the hard deadline with nothing posted.
+   */
+  reviewBudgetMs?: number;
+  /** Structured per-run events for the dashboard monitor. */
+  run?: Pick<RunLog, "stage" | "log">;
 }
 
 export type PipelineResult =
@@ -85,13 +94,16 @@ const BATCH_CHAR_BUDGET = 60_000;
 const MAX_PATCH_CHARS = 40_000;
 const REVIEWER_CONCURRENCY = 4;
 const RETRY_CONCURRENCY = 2;
+const JUDGE_MIN_SCORE = 6;
 
 // ------------------------------------------------------------------ pipeline
 
 export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineResult> {
   const { job, settings, github, state, llm, log, signal } = deps;
+  const run = deps.run ?? { stage: () => undefined, log: () => undefined };
   const profile = DEPTH_PROFILES[settings.depth];
 
+  run.stage("load", `Loading PR #${job.prNumber}`, { depth: settings.depth, reviewers: settings.reviewers.join(", ") });
   const pr = await github.getPullRequest();
   if (pr.state !== "open") return { status: "skipped", reason: "pr-not-open" };
   // Auto reviews for an older push are superseded by the newer push's job.
@@ -134,14 +146,17 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     candidates.push(file);
   }
 
+  run.log("info", `${candidates.length} reviewable files, ${skipped} skipped`, { mode, total: allFiles.length });
   if (candidates.length === 0) {
     await state.saveState({ lastReviewedSha: pr.headSha });
     return { status: "skipped", reason: scope ? "no-reviewable-changes-since-last-review" : "no-reviewable-files" };
   }
 
   // ---- triage
+  run.stage("triage", `Triaging with ${settings.triageModel}`);
   const triage = await runTriage(llm, settings, pr, candidates, signal).catch((err: Error) => {
     log("triage failed, continuing without it", { error: err.message });
+    run.log("warn", "Triage failed, continuing without it", { error: err.message });
     return undefined;
   });
   const meta = new Map(triage?.files.map((f) => [f.path, f]) ?? []);
@@ -172,26 +187,52 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
 
   let nextId = 0;
   const allocate = () => ++nextId;
-  const units = settings.reviewers.flatMap((kind) => batches.map((files) => ({ kind, files })));
+  const units = settings.reviewers.flatMap((kind) => batches.map((files, batch) => ({ kind, files, batch })));
+  run.stage("review", `Running ${units.length} reviewer passes`, {
+    files: reviewFiles.length,
+    batches: batches.length,
+    toolSteps: profile.toolSteps,
+  });
 
   /** One reviewer over one batch. Resolves to undefined on failure so siblings keep going. */
-  const runUnit = async ({ kind, files }: (typeof units)[number]): Promise<Finding[] | undefined> => {
+  const reviewSignal = deps.reviewBudgetMs
+    ? AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(deps.reviewBudgetMs)])
+    : signal;
+
+  const runUnit = async (
+    { kind, files, batch }: (typeof units)[number],
+    model = settings.model,
+  ): Promise<Finding[] | undefined> => {
+    if (reviewSignal?.aborted) return undefined;
+    const label = batches.length > 1 ? `${kind} #${batch + 1}` : kind;
+    const startedAt = Date.now();
     try {
       const found = await runReviewer({
         kind,
         llm,
-        settings,
+        settings: model === settings.model ? settings : { ...settings, model },
         toolSteps: profile.toolSteps,
         ctx,
         files,
         workspace,
-        signal,
-        log: (m) => log(m),
+        signal: reviewSignal,
+        log: (m) => {
+          log(m);
+          run.log("info", m, { reviewer: label });
+        },
       });
-      return anchorFindings(kind as ReviewerKind, found, patches, allocate);
+      const anchored = anchorFindings(kind as ReviewerKind, found, patches, allocate);
+      run.log("info", `${label}: ${anchored.length} findings (${found.length - anchored.length} dropped by anchoring)`, {
+        reviewer: label,
+        ms: Date.now() - startedAt,
+      });
+      return anchored;
     } catch (err) {
+      // The job itself was cancelled: stop everything. A spent review budget is just a failed pass.
       if (signal?.aborted) throw err;
-      log("reviewer failed", { reviewer: kind, error: (err as Error).message });
+      const message = reviewSignal?.aborted ? "review time budget exhausted" : (err as Error).message;
+      log("reviewer failed", { reviewer: kind, error: message });
+      run.log("error", `${label} failed`, { reviewer: label, error: message });
       return undefined;
     }
   };
@@ -199,13 +240,16 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
   let raw: Finding[];
   let failedPasses: number;
   try {
-    const outcomes = await mapLimit(units, REVIEWER_CONCURRENCY, runUnit);
+    const outcomes = await mapLimit(units, REVIEWER_CONCURRENCY, (unit) => runUnit(unit));
     // Upstream model errors are often transient. Give failed passes one more
     // chance at low concurrency before declaring them lost.
     const failedIdx = outcomes.flatMap((o, i) => (o === undefined ? [i] : []));
-    if (failedIdx.length > 0) {
-      log("retrying failed reviewer passes", { count: failedIdx.length });
-      const retried = await mapLimit(failedIdx, RETRY_CONCURRENCY, (i) => runUnit(units[i]!));
+    if (failedIdx.length > 0 && !reviewSignal?.aborted) {
+      // Upstream outages tend to be per-model, so the retry goes to the fallback model when one is configured.
+      const fallback = settings.triageModel || settings.model;
+      log("retrying failed reviewer passes", { count: failedIdx.length, model: fallback });
+      run.log("warn", `Retrying ${failedIdx.length} failed reviewer passes on ${fallback}`);
+      const retried = await mapLimit(failedIdx, RETRY_CONCURRENCY, (i) => runUnit(units[i]!, fallback));
       failedIdx.forEach((unitIndex, j) => {
         outcomes[unitIndex] = retried[j];
       });
@@ -220,12 +264,20 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
   // ---- judge + select
   let findings = dedupeFindings(raw);
   if (profile.useJudge && findings.length > 0) {
+    run.stage("judge", `Judging ${findings.length} candidate findings`, { raw: raw.length });
+    const before = findings.length;
     findings = await runJudge(llm, settings, ctx, findings, signal).catch((err: Error) => {
       log("judge failed, keeping deduped findings", { error: err.message });
+      run.log("warn", "Judge failed, keeping deduped findings", { error: err.message });
       return findings;
     });
+    run.log("info", `Judge kept ${findings.length} of ${before}`);
   }
-  const posted = selectFindings(findings, settings.minSeverity, settings.maxComments);
+  const selected = selectFindings(findings, settings.minSeverity, settings.maxComments);
+  // Nits don't deserve an inline notification each; they go in a collapsible list in the review body.
+  const posted = selected.filter((f) => f.severity !== "nit");
+  const nits = selected.filter((f) => f.severity === "nit");
+  run.stage("publish", `Publishing ${posted.length} comments`, { failedPasses });
 
   // ---- publish summary (always on full reviews, or if none exists yet)
   let summaryCommentId = await state.getSummaryCommentId();
@@ -238,6 +290,7 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
       );
     } catch (err) {
       log("summary failed", { error: (err as Error).message });
+      run.log("warn", "Summary failed", { error: (err as Error).message });
     }
   }
 
@@ -253,6 +306,7 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     raw: raw.length,
     posted,
     unplaced: [],
+    nits,
     failedPasses,
     totalPasses: units.length,
   };
@@ -267,6 +321,7 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     // every finding in the review body so nothing is lost.
     if ((err as { status?: number }).status !== 422) throw err;
     log("inline comments rejected, posting findings in review body");
+    run.log("warn", "GitHub rejected inline comments, posted findings in the review body");
     await github.createReview({
       commitId: pr.headSha,
       body: renderReviewBody({ ...stats, unplaced: posted }, deps.mention),
@@ -285,7 +340,7 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     status: "completed",
     filesReviewed: reviewFiles.length,
     findingsRaw: raw.length,
-    commentsPosted: posted.length,
+    commentsPosted: posted.length + nits.length,
     failedPasses,
   };
 }
@@ -358,7 +413,8 @@ const JudgeSchema = z.object({
   verdicts: z.array(
     z.object({
       id: z.coerce.number(),
-      keep: z.boolean(),
+      keep: z.boolean().optional(),
+      score: z.coerce.number().min(0).max(10).optional().catch(undefined),
       severity: z.enum(["critical", "major", "minor", "nit"]).optional().catch(undefined),
     }),
   ),
@@ -378,8 +434,11 @@ async function runJudge(
     line: f.startLine ? `${f.startLine}-${f.line}` : f.line,
     severity: f.severity,
     title: f.title,
+    scenario: f.scenario,
+    quoteVerified: f.verified,
     body: f.body,
     suggestion: f.suggestion,
+    confidence: f.confidence,
   }));
   const result = await llm.chatJson(
     {
@@ -406,7 +465,9 @@ async function runJudge(
     const verdict = verdicts.get(f.id);
     // A finding the judge forgot to rule on is kept; the judge filters noise, it does not gate.
     if (!verdict) return [f];
-    if (!verdict.keep) return [];
+    // The score is the calibrated signal; "keep" is a fallback for models that omit it.
+    const keep = verdict.score !== undefined ? verdict.score >= JUDGE_MIN_SCORE : verdict.keep !== false;
+    if (!keep) return [];
     return [{ ...f, severity: verdict.severity ?? f.severity }];
   });
 }

@@ -61,6 +61,31 @@ export async function listAccessibleRepos(session: Session): Promise<AccessibleR
   return repos.sort((a, b) => a.fullName.localeCompare(b.fullName));
 }
 
+const ACCESS_TTL_MS = 60_000;
+const ACCESS_CACHE_MAX = 500;
+const accessCache = new Map<string, { at: number; repos: Promise<AccessibleRepo[]> }>();
+
+/**
+ * Same as listAccessibleRepos, memoized per user token for a minute. Used by
+ * polling endpoints so the run monitor doesn't burn the user's GitHub rate limit.
+ * Keyed by token so a new login (or revoked token) never reuses stale access.
+ */
+export function listAccessibleReposCached(session: Session): Promise<AccessibleRepo[]> {
+  const now = Date.now();
+  const hit = accessCache.get(session.token);
+  if (hit && now - hit.at < ACCESS_TTL_MS) return hit.repos;
+
+  const repos = listAccessibleRepos(session);
+  // Don't cache failures.
+  repos.catch(() => accessCache.delete(session.token));
+  if (accessCache.size >= ACCESS_CACHE_MAX) {
+    for (const [key, entry] of accessCache) if (now - entry.at >= ACCESS_TTL_MS) accessCache.delete(key);
+    if (accessCache.size >= ACCESS_CACHE_MAX) accessCache.clear();
+  }
+  accessCache.set(session.token, { at: now, repos });
+  return repos;
+}
+
 export async function findAccessibleRepo(session: Session, repoId: number): Promise<AccessibleRepo | undefined> {
   if (!Number.isSafeInteger(repoId) || repoId <= 0) return undefined;
   return (await listAccessibleRepos(session)).find((r) => r.repoId === repoId);

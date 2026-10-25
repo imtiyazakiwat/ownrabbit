@@ -24,6 +24,8 @@ export interface LlmConfig {
   apiKey: string;
   maxRetries?: number;
   fetchImpl?: typeof fetch;
+  /** Called before each backoff sleep, e.g. to surface upstream outages in the run monitor. */
+  onRetry?: (info: { attempt: number; delayMs: number; error: string }) => void;
 }
 
 export class LlmError extends Error {
@@ -51,7 +53,21 @@ export interface LlmClient {
   readonly tokensUsed: number;
 }
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+/** Sleep that ends early (rejecting) when the signal aborts, so retries never outlive the job. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(signal!.reason);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 export function createLlmClient(config: LlmConfig): LlmClient {
   const fetchImpl = config.fetchImpl ?? fetch;
@@ -107,7 +123,9 @@ export function createLlmClient(config: LlmConfig): LlmClient {
         if (!retryable || attempt === maxRetries || signal?.aborted) throw err;
         // Upstream 5xx usually means the provider is overloaded: back off harder.
         const base = err instanceof LlmError && (err.status ?? 0) >= 500 ? 4000 : 1000;
-        await sleep(Math.min(base * 2 ** attempt, 30_000) + Math.random() * 1000);
+        const delayMs = Math.round(Math.min(base * 2 ** attempt, 30_000) + Math.random() * 1000);
+        config.onRetry?.({ attempt: attempt + 1, delayMs, error: (err as Error).message.slice(0, 200) });
+        await sleep(delayMs, signal);
       }
     }
     throw lastError;

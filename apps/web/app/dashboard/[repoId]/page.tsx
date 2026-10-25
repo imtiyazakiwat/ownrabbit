@@ -108,7 +108,12 @@ export default async function RepoPage({ params }: { params: Promise<{ repoId: s
           <h2 id="history" className="font-display text-2xl">
             Review history
           </h2>
-          <span className="text-xs text-dim">last 25</span>
+          <span className="flex gap-4 text-xs text-dim">
+            last 25
+            <Link href={`/dashboard/runs?repo=${repo.repoId}`} className="text-carrot hover:underline">
+              Open monitor →
+            </Link>
+          </span>
         </div>
         {reviews === null ? (
           <p className="mt-4 text-sm text-del">Couldn’t load review history.</p>
@@ -143,7 +148,9 @@ export default async function RepoPage({ params }: { params: Promise<{ repoId: s
                     </td>
                     <td className="py-2.5 text-muted">{r.trigger === "mention" ? "mention" : "auto"}</td>
                     <td className={`py-2.5 ${STATUS_TONE[r.status] ?? ""}`}>
-                      {r.status}
+                      <Link href={`/dashboard/runs?run=${encodeURIComponent(r.jobId)}&repo=${repo.repoId}`} className="hover:underline">
+                        {r.status}
+                      </Link>
                       {(r.error || r.reason) && <span className="ml-2 text-dim">{(r.error ?? r.reason)!.slice(0, 40)}</span>}
                     </td>
                     <td className="py-2.5 text-right tabular-nums">{r.filesReviewed ?? "—"}</td>

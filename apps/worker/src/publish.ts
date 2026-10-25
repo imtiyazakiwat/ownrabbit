@@ -23,16 +23,43 @@ function fence(content: string): string {
   return "`".repeat(longest + 1);
 }
 
+const EFFORT_LABEL = { trivial: "Quick win", small: "Small fix", medium: "Medium effort", large: "Heavy lift" } as const;
+
+const REVIEWER_LABEL: Record<string, string> = {
+  security: "Security",
+  bugs: "Correctness",
+  performance: "Performance",
+  style: "Maintainability",
+  tests: "Tests",
+};
+
+/** Collapse whitespace so model text can't open new markdown blocks inside a <summary>. */
+const oneLine = (text: string) => sanitizeInline(text).replace(/\s+/g, " ").trim();
+
 export function renderInlineComment(f: Finding): string {
-  const parts = [
-    `**${SEVERITY_BADGE[f.severity]}** · _${sanitizeInline(f.category)}_`,
-    `**${sanitizeInline(f.title)}**`,
-    sanitizeInline(f.body),
-  ];
+  const meta = [
+    `**${SEVERITY_BADGE[f.severity]}**`,
+    `**${REVIEWER_LABEL[f.reviewer] ?? f.reviewer}**`,
+    `_${oneLine(f.category)}_`,
+    f.effort ? EFFORT_LABEL[f.effort] : undefined,
+  ].filter(Boolean);
+  const parts = [meta.join(" · "), `**${sanitizeInline(f.title)}**`, sanitizeInline(f.body)];
+  if (f.scenario) parts.push(`> **When it breaks:** ${oneLine(f.scenario)}`);
   if (f.suggestion !== undefined) {
     const ticks = fence(f.suggestion);
     parts.push(`${ticks}suggestion\n${f.suggestion}\n${ticks}`);
   }
+  if (f.agentPrompt) {
+    const prompt = `In \`${f.path}\` around line ${f.line}: ${oneLine(f.agentPrompt)}`;
+    const ticks = fence(prompt);
+    parts.push(
+      `<details>\n<summary>🤖 Prompt for AI agents</summary>\n\n${ticks}text\n${prompt}\n${ticks}\n\n</details>`,
+    );
+  }
+  const footer = [f.verified ? "✓ quote matched diff" : undefined, `confidence ${Math.round(f.confidence * 100)}%`]
+    .filter(Boolean)
+    .join(" · ");
+  parts.push(`<sub>${footer}</sub>`);
   return parts.join("\n\n");
 }
 
@@ -67,6 +94,8 @@ export interface ReviewStats {
   posted: Finding[];
   /** Findings that could not be anchored as inline comments. */
   unplaced: Finding[];
+  /** Nit-level findings listed in the body instead of inline. */
+  nits?: Finding[];
   /** Reviewer passes (reviewer × file batch) that failed even after retry. */
   failedPasses: number;
   totalPasses: number;
@@ -77,7 +106,9 @@ export function renderReviewBody(stats: ReviewStats, mention: string): string {
   for (const f of stats.posted) counts.set(f.severity, (counts.get(f.severity) ?? 0) + 1);
   const tally =
     stats.posted.length === 0
-      ? "No issues found. 🐇"
+      ? (stats.nits?.length ?? 0) > 0
+        ? "No actionable issues found, just a few nitpicks. 🐇"
+        : "No issues found. 🐇"
       : [...counts.entries()].map(([s, n]) => `${SEVERITY_BADGE[s]}: ${n}`).join(" · ");
 
   const range =
@@ -89,7 +120,9 @@ export function renderReviewBody(stats: ReviewStats, mention: string): string {
   const partial = stats.failedPasses > 0;
   const headline = partial && stats.posted.length === 0 ? "No issues found in the parts that were reviewed." : tally;
 
+  const inline = stats.posted.length - stats.unplaced.length;
   const lines = [reviewMarker(stats.headSha), `**OwnRabbit review** of ${range}`, "", headline];
+  if (inline > 0) lines.push("", `**Actionable comments posted: ${inline}**`);
 
   if (partial) {
     lines.push(
@@ -98,6 +131,15 @@ export function renderReviewBody(stats: ReviewStats, mention: string): string {
       `> **Partial review.** ${stats.failedPasses} of ${stats.totalPasses} reviewer passes failed because the model was unavailable. ` +
         `Comment \`${mention} full review\` to retry.`,
     );
+  }
+
+  const nits = stats.nits ?? [];
+  if (nits.length > 0) {
+    lines.push("", `<details><summary>🧹 Nitpick comments (${nits.length})</summary>`, "");
+    for (const f of nits) {
+      lines.push(`- \`${f.path}:${f.startLine ? `${f.startLine}-` : ""}${f.line}\`: **${sanitizeInline(f.title)}**. ${sanitizeInline(f.body).replace(/\s*\n+\s*/g, " ")}`);
+    }
+    lines.push("", "</details>");
   }
 
   if (stats.unplaced.length > 0) {

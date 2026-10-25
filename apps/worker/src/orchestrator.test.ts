@@ -163,6 +163,16 @@ describe("runReviewPipeline", () => {
     expect(state.saved.at(-1)).toEqual({ lastReviewedSha: HEAD, summaryCommentId: 42 });
   });
 
+  it("reports each stage to the run monitor", async () => {
+    const stages: string[] = [];
+    const errors: string[] = [];
+    const run = { stage: (name: string) => void stages.push(name), log: (level: string, m: string) => void (level === "error" && errors.push(m)) };
+    const multi = settings({ reviewers: ["security", "bugs"] });
+    await runReviewPipeline({ ...deps({ settings: multi, llm: fakeLlm({ fail: /focus: correctness/ }) }), run });
+    expect(stages).toEqual(["load", "triage", "review", "judge", "publish"]);
+    expect(errors.some((m) => m.startsWith("bugs failed"))).toBe(true);
+  });
+
   it("never sends lockfiles to reviewers", async () => {
     const llm = fakeLlm();
     await runReviewPipeline(deps({ llm }));
@@ -176,6 +186,13 @@ describe("runReviewPipeline", () => {
     const result = await runReviewPipeline(deps({ llm, github: gh.port }));
     expect(result).toMatchObject({ status: "completed", commentsPosted: 0 });
     expect(gh.reviews[0]!.body).toContain("No issues found");
+  });
+
+  it("uses the judge score over its keep flag", async () => {
+    const low = fakeLlm({ judge: { verdicts: [{ id: 1, keep: true, score: 4 }] } });
+    expect(await runReviewPipeline(deps({ llm: low }))).toMatchObject({ commentsPosted: 0 });
+    const high = fakeLlm({ judge: { verdicts: [{ id: 1, keep: false, score: 9 }] } });
+    expect(await runReviewPipeline(deps({ llm: high }))).toMatchObject({ commentsPosted: 1 });
   });
 
   it("keeps findings if the judge itself fails", async () => {
@@ -243,7 +260,8 @@ describe("runReviewPipeline", () => {
     const body = gh.reviews[0]!.body;
     expect(body).toContain("Partial review");
     expect(body).toContain("1 of 2 reviewer passes failed");
-    expect(state.saved.every((s) => (s as { lastReviewedSha?: string }).lastReviewedSha === undefined)).toBe(true);
+    // Only the summary id is persisted; the cursor stays put.
+    expect(state.saved).toEqual([{ summaryCommentId: 42 }]);
   });
 
   it("retries a transiently failing reviewer pass once", async () => {

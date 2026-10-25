@@ -1,6 +1,6 @@
 import { SEVERITIES, severityRank, type ReviewerKind, type Severity } from "@ownrabbit/core";
 import { z } from "zod";
-import { isValidRange, nearestCommentableLine, type ParsedPatch } from "./diff";
+import { isValidRange, locateSnippet, nearestCommentableLine, snippetMatches, type ParsedPatch } from "./diff";
 
 export const RawFindingSchema = z.object({
   path: z.string().min(1),
@@ -11,6 +11,13 @@ export const RawFindingSchema = z.object({
   title: z.string().min(1).max(200),
   body: z.string().min(1).max(6000),
   suggestion: z.string().max(8000).optional().nullable(),
+  /** Verbatim quote of the cited lines. Used to verify and repair the anchor. */
+  existingCode: z.string().max(4000).optional().nullable(),
+  /** Concrete inputs/sequence that trigger the problem. */
+  scenario: z.string().max(1000).optional().nullable(),
+  effort: z.enum(["trivial", "small", "medium", "large"]).optional().nullable().catch(undefined),
+  /** Self-contained instructions an AI coding agent could follow to fix it. */
+  agentPrompt: z.string().max(2000).optional().nullable(),
   confidence: z.coerce.number().min(0).max(1).catch(0.5),
 });
 
@@ -27,6 +34,11 @@ export interface Finding {
   title: string;
   body: string;
   suggestion?: string;
+  scenario?: string;
+  effort?: "trivial" | "small" | "medium" | "large";
+  agentPrompt?: string;
+  /** True when the model's quote matched the diff at the anchored lines. */
+  verified: boolean;
   confidence: number;
 }
 
@@ -44,10 +56,16 @@ export function parseFindings(value: unknown): RawFinding[] {
 const MIN_CONFIDENCE = 0.55;
 
 /**
- * Anchor findings to real diff lines. Findings citing lines outside the diff
- * are nudged to the nearest commentable line, or dropped. Suggestions are
- * removed when the range had to be changed, since they would replace the
- * wrong code.
+ * Anchor findings to real diff lines.
+ *
+ * 1. If the model quoted the code (existingCode), the quote wins: it is
+ *    located in the diff and the line range is corrected to match. A quote
+ *    that appears nowhere in the diff means the model is describing code
+ *    that isn't there, so the finding is dropped.
+ * 2. Without a quote, citations outside the diff are nudged to the nearest
+ *    commentable line, or dropped.
+ * Suggestions are removed whenever the range had to be guessed, since they
+ * would replace the wrong code.
  */
 export function anchorFindings(
   reviewer: ReviewerKind,
@@ -65,8 +83,21 @@ export function anchorFindings(
     let line = f.line;
     let startLine = f.startLine ?? undefined;
     let suggestion = f.suggestion?.trim() ? stripFence(f.suggestion) : undefined;
+    let verified = false;
 
-    if (!isValidRange(patch, line, startLine)) {
+    const quote = f.existingCode?.trim() ? stripFence(f.existingCode) : undefined;
+    if (quote) {
+      if (isValidRange(patch, line, startLine) && snippetMatches(patch, quote, startLine ?? line, line)) {
+        verified = true;
+      } else {
+        const found = locateSnippet(patch, quote);
+        if (!found) continue;
+        verified = true;
+        line = found.line;
+        startLine = found.startLine === found.line ? undefined : found.startLine;
+        // The suggestion was written for the quoted range, which we now point at exactly.
+      }
+    } else if (!isValidRange(patch, line, startLine)) {
       const nearest = nearestCommentableLine(patch, line);
       if (nearest === undefined) continue;
       line = nearest;
@@ -86,6 +117,10 @@ export function anchorFindings(
       title: f.title.trim(),
       body: f.body.trim(),
       suggestion,
+      scenario: f.scenario?.trim() || undefined,
+      effort: f.effort ?? undefined,
+      agentPrompt: f.agentPrompt?.trim() || undefined,
+      verified,
       confidence: f.confidence,
     });
   }
@@ -100,7 +135,10 @@ function stripFence(text: string): string {
 /** Cheap structural dedupe before the judge: same file, overlapping lines, similar title. */
 export function dedupeFindings(findings: Finding[]): Finding[] {
   const sorted = [...findings].sort(
-    (a, b) => severityRank(a.severity) - severityRank(b.severity) || b.confidence - a.confidence,
+    (a, b) =>
+      severityRank(a.severity) - severityRank(b.severity) ||
+      Number(b.verified) - Number(a.verified) ||
+      b.confidence - a.confidence,
   );
   const kept: Finding[] = [];
   for (const f of sorted) {
