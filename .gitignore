@@ -1,0 +1,18 @@
+node_modules/
+.next/
+dist/
+out/
+coverage/
+.vercel/
+*.tsbuildinfo
+.DS_Store
+
+# secrets
+.env
+.env.*
+!.env.example
+*.pem
+.secrets/
+service-account*.json
+.vercel
+.env*
