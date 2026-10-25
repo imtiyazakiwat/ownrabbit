@@ -55,7 +55,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function createLlmClient(config: LlmConfig): LlmClient {
   const fetchImpl = config.fetchImpl ?? fetch;
-  const maxRetries = config.maxRetries ?? 3;
+  const maxRetries = config.maxRetries ?? 4;
   const url = `${config.baseUrl.replace(/\/+$/, "")}/chat/completions`;
   let tokensUsed = 0;
 
@@ -105,7 +105,9 @@ export function createLlmClient(config: LlmConfig): LlmClient {
         lastError = err;
         const retryable = err instanceof LlmError && err.retryable;
         if (!retryable || attempt === maxRetries || signal?.aborted) throw err;
-        await sleep(Math.min(1000 * 2 ** attempt, 15_000) + Math.random() * 500);
+        // Upstream 5xx usually means the provider is overloaded: back off harder.
+        const base = err instanceof LlmError && (err.status ?? 0) >= 500 ? 4000 : 1000;
+        await sleep(Math.min(base * 2 ** attempt, 30_000) + Math.random() * 1000);
       }
     }
     throw lastError;

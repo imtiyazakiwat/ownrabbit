@@ -58,7 +58,8 @@ export interface GitHubPort {
 export interface StatePort {
   getLastReviewedSha(): Promise<string | undefined>;
   getSummaryCommentId(): Promise<number | undefined>;
-  saveState(state: { lastReviewedSha: string; summaryCommentId?: number }): Promise<void>;
+  /** Merge-update; omitted fields are left unchanged. */
+  saveState(state: { lastReviewedSha?: string; summaryCommentId?: number }): Promise<void>;
 }
 
 export interface PipelineDeps {
@@ -75,14 +76,15 @@ export interface PipelineDeps {
 
 export type PipelineResult =
   | { status: "skipped"; reason: string }
-  | { status: "completed"; filesReviewed: number; findingsRaw: number; commentsPosted: number };
+  | { status: "completed"; filesReviewed: number; findingsRaw: number; commentsPosted: number; failedPasses: number };
 
 // ------------------------------------------------------------------ limits
 
 const MAX_FILES = 150;
 const BATCH_CHAR_BUDGET = 60_000;
 const MAX_PATCH_CHARS = 40_000;
-const REVIEWER_CONCURRENCY = 6;
+const REVIEWER_CONCURRENCY = 4;
+const RETRY_CONCURRENCY = 2;
 
 // ------------------------------------------------------------------ pipeline
 
@@ -170,37 +172,50 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
 
   let nextId = 0;
   const allocate = () => ++nextId;
-  let failures = 0;
   const units = settings.reviewers.flatMap((kind) => batches.map((files) => ({ kind, files })));
 
+  /** One reviewer over one batch. Resolves to undefined on failure so siblings keep going. */
+  const runUnit = async ({ kind, files }: (typeof units)[number]): Promise<Finding[] | undefined> => {
+    try {
+      const found = await runReviewer({
+        kind,
+        llm,
+        settings,
+        toolSteps: profile.toolSteps,
+        ctx,
+        files,
+        workspace,
+        signal,
+        log: (m) => log(m),
+      });
+      return anchorFindings(kind as ReviewerKind, found, patches, allocate);
+    } catch (err) {
+      if (signal?.aborted) throw err;
+      log("reviewer failed", { reviewer: kind, error: (err as Error).message });
+      return undefined;
+    }
+  };
+
   let raw: Finding[];
+  let failedPasses: number;
   try {
-    const results = await mapLimit(units, REVIEWER_CONCURRENCY, async ({ kind, files }) => {
-      try {
-        const found = await runReviewer({
-          kind,
-          llm,
-          settings,
-          toolSteps: profile.toolSteps,
-          ctx,
-          files,
-          workspace,
-          signal,
-          log: (m) => log(m),
-        });
-        return anchorFindings(kind as ReviewerKind, found, patches, allocate);
-      } catch (err) {
-        if (signal?.aborted) throw err;
-        failures++;
-        log("reviewer failed", { reviewer: kind, error: (err as Error).message });
-        return [];
-      }
-    });
-    raw = results.flat();
+    const outcomes = await mapLimit(units, REVIEWER_CONCURRENCY, runUnit);
+    // Upstream model errors are often transient. Give failed passes one more
+    // chance at low concurrency before declaring them lost.
+    const failedIdx = outcomes.flatMap((o, i) => (o === undefined ? [i] : []));
+    if (failedIdx.length > 0) {
+      log("retrying failed reviewer passes", { count: failedIdx.length });
+      const retried = await mapLimit(failedIdx, RETRY_CONCURRENCY, (i) => runUnit(units[i]!));
+      failedIdx.forEach((unitIndex, j) => {
+        outcomes[unitIndex] = retried[j];
+      });
+    }
+    raw = outcomes.flatMap((o) => o ?? []);
+    failedPasses = outcomes.filter((o) => o === undefined).length;
   } finally {
     await workspace?.dispose();
   }
-  if (failures === units.length) throw new Error("All reviewers failed");
+  if (failedPasses === units.length) throw new Error("All reviewers failed");
 
   // ---- judge + select
   let findings = dedupeFindings(raw);
@@ -238,6 +253,8 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     raw: raw.length,
     posted,
     unplaced: [],
+    failedPasses,
+    totalPasses: units.length,
   };
   try {
     await github.createReview({
@@ -257,12 +274,19 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     });
   }
 
-  await state.saveState({ lastReviewedSha: pr.headSha, summaryCommentId });
+  // A partial review must not advance the incremental cursor, or the files
+  // the failed reviewers never saw would be skipped on the next push.
+  if (failedPasses === 0) {
+    await state.saveState({ lastReviewedSha: pr.headSha, summaryCommentId });
+  } else if (summaryCommentId !== undefined) {
+    await state.saveState({ summaryCommentId });
+  }
   return {
     status: "completed",
     filesReviewed: reviewFiles.length,
     findingsRaw: raw.length,
     commentsPosted: posted.length,
+    failedPasses,
   };
 }
 
