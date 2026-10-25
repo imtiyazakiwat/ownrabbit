@@ -10,7 +10,8 @@ permissions:
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # Superseded PR runs are cancelled; runs on main never are, so a deploy is never cut off half-way.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
@@ -32,3 +33,59 @@ jobs:
         env:
           # Build-time only; routes read real env at request time.
           NEXT_TELEMETRY_DISABLED: "1"
+
+  deploy-web:
+    name: Deploy web (Vercel production)
+    needs: check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The environment only allows main and holds the Vercel secrets, so PR and fork runs can't read them.
+    environment:
+      name: production
+      url: https://ownrabbit.vercel.app
+    concurrency:
+      group: deploy-web-production
+      cancel-in-progress: false
+    env:
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      VERCEL_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install Vercel CLI
+        run: npm install --global vercel@65.2.0
+      - name: Check deploy credentials
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          for name in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID; do
+            if [ -z "${!name}" ]; then echo "::error::Secret $name is empty in the production environment"; exit 1; fi
+          done
+      # The token goes through the env, never on the command line, so it can't leak in process listings.
+      # The project's Root Directory (apps/web) is applied by the CLI, so these run from the repo root.
+      - name: Pull production settings
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel pull --yes --environment=production
+      - name: Build
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel build --prod
+      - name: Deploy
+        id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          url=$(vercel deploy --prebuilt --prod)
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "Deployed $url" >> "$GITHUB_STEP_SUMMARY"
+      - name: Smoke test
+        # Per-deployment URLs sit behind Vercel deployment protection (302 to login),
+        # so check the public production alias. -f fails on HTTP errors.
+        run: curl -fsS --retry 5 --retry-delay 5 --retry-all-errors -o /dev/null -w "%{http_code}\n" https://ownrabbit.vercel.app/
