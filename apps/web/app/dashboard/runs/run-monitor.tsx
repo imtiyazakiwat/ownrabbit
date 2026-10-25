@@ -17,6 +17,7 @@ const STAGES = [
   { key: "triage", label: "Triage" },
   { key: "review", label: "Review" },
   { key: "judge", label: "Judge" },
+  { key: "principal", label: "Principal" },
   { key: "publish", label: "Publish" },
   { key: "done", label: "Done" },
 ] as const;

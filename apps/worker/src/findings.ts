@@ -23,9 +23,12 @@ export const RawFindingSchema = z.object({
 
 export type RawFinding = z.infer<typeof RawFindingSchema>;
 
+export type ConfidenceLabel = "confirmed" | "likely" | "possible";
+
 export interface Finding {
   id: number;
-  reviewer: ReviewerKind;
+  /** A specialist, or the principal pass. */
+  reviewer: ReviewerKind | "principal";
   path: string;
   line: number;
   startLine?: number;
@@ -40,6 +43,12 @@ export interface Finding {
   /** True when the model's quote matched the diff at the anchored lines. */
   verified: boolean;
   confidence: number;
+  /** Set by the principal pass. */
+  impact?: string;
+  steelman?: string;
+  confidenceLabel?: ConfidenceLabel;
+  /** Cites a file outside the diff, so it can only appear in the review body. */
+  outsideDiff?: boolean;
 }
 
 /** Parse loosely: one malformed finding must not discard the rest. */
@@ -68,7 +77,7 @@ const MIN_CONFIDENCE = 0.55;
  * would replace the wrong code.
  */
 export function anchorFindings(
-  reviewer: ReviewerKind,
+  reviewer: Finding["reviewer"],
   raw: RawFinding[],
   patches: Map<string, ParsedPatch>,
   nextId: () => number,

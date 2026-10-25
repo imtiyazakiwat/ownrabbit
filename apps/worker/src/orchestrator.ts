@@ -10,6 +10,7 @@ import {
   type RepoSettings,
   type ReviewJob,
   type ReviewerKind,
+  severityRank,
 } from "@ownrabbit/core";
 import { z } from "zod";
 import { parsePatch, renderNumberedPatch, type ParsedPatch } from "./diff";
@@ -18,11 +19,17 @@ import type { LlmClient } from "./llm";
 import { mapLimit } from "./limit";
 import { JUDGE_PROMPT, SUMMARY_PROMPT, TRIAGE_PROMPT, untrusted } from "./prompts";
 import {
+  renderPrincipalReviewBody,
   renderReviewBody,
   renderSummaryComment,
   toReviewComments,
+  type PrincipalView,
   type ReviewStats,
 } from "./publish";
+
+export type ReviewEvent = "COMMENT" | "REQUEST_CHANGES";
+import { loadGuidelines, type GuidelineSource, type Guidelines } from "./guidelines";
+import { deriveVerdict, runPrincipal, type PrincipalReport, type Verdict } from "./principal";
 import { runReviewer, type ReviewContext, type ReviewFile } from "./reviewer";
 import type { Workspace } from "./repo";
 import type { RunLog } from "./runlog";
@@ -47,13 +54,20 @@ export interface ChangedFile {
 }
 
 /** GitHub operations the pipeline needs. Implemented with Octokit in github.ts. */
-export interface GitHubPort {
+export interface GitHubPort extends GuidelineSource {
   getPullRequest(): Promise<PullRequest>;
   listPullRequestFiles(): Promise<ChangedFile[]>;
   /** Files changed between two commits, or undefined if not comparable (e.g. force push). */
   compareFiles(base: string, head: string): Promise<string[] | undefined>;
   upsertSummaryComment(body: string, knownId?: number): Promise<number>;
-  createReview(args: { commitId: string; body: string; comments: ReturnType<typeof toReviewComments> }): Promise<void>;
+  createReview(args: {
+    commitId: string;
+    body: string;
+    comments: ReturnType<typeof toReviewComments>;
+    event?: ReviewEvent;
+  }): Promise<void>;
+  /** Dismiss our earlier REQUEST_CHANGES reviews; a COMMENT review does not clear them. */
+  dismissStaleChangeRequests(message: string): Promise<number>;
 }
 
 export interface StatePort {
@@ -85,7 +99,15 @@ export interface PipelineDeps {
 
 export type PipelineResult =
   | { status: "skipped"; reason: string }
-  | { status: "completed"; filesReviewed: number; findingsRaw: number; commentsPosted: number; failedPasses: number };
+  | {
+      status: "completed";
+      filesReviewed: number;
+      findingsRaw: number;
+      commentsPosted: number;
+      failedPasses: number;
+      /** Present when the principal pass ran. */
+      verdict?: Verdict;
+    };
 
 // ------------------------------------------------------------------ limits
 
@@ -183,7 +205,18 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     instructions: job.instructions,
   };
   const batches = batchFiles(reviewFiles, BATCH_CHAR_BUDGET);
-  const workspace = profile.toolSteps > 0 ? deps.createWorkspace(pr.headSha) : undefined;
+  const usePrincipal = settings.principalReview && profile.principalSteps > 0;
+  const workspace = profile.toolSteps > 0 || usePrincipal ? deps.createWorkspace(pr.headSha) : undefined;
+
+  // Maintainer-written rules from the base commit; the PR under review cannot change them.
+  let guidelines: Guidelines | undefined;
+  if (settings.useRepoGuidelines) {
+    guidelines = await loadGuidelines(github, pr.baseSha).catch((err: Error) => {
+      run.log("warn", "Could not load repository guidelines", { error: err.message });
+      return undefined;
+    });
+    if (guidelines) run.log("info", `Loaded ${guidelines.files.length} guideline files`, { files: guidelines.files.join(", ") });
+  }
 
   let nextId = 0;
   const allocate = () => ++nextId;
@@ -214,7 +247,8 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
         toolSteps: profile.toolSteps,
         ctx,
         files,
-        workspace,
+        workspace: profile.toolSteps > 0 ? workspace : undefined,
+        guidelines: guidelines?.text,
         signal: reviewSignal,
         log: (m) => {
           log(m);
@@ -237,8 +271,12 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     }
   };
 
-  let raw: Finding[];
-  let failedPasses: number;
+  let raw: Finding[] = [];
+  let failedPasses = 0;
+  let findings: Finding[] = [];
+  let principal: PrincipalReport | undefined;
+  let summaryMarkdown: Promise<string | undefined> = Promise.resolve(undefined);
+  let summaryCommentId = await state.getSummaryCommentId();
   try {
     const outcomes = await mapLimit(units, REVIEWER_CONCURRENCY, (unit) => runUnit(unit));
     // Upstream model errors are often transient. Give failed passes one more
@@ -256,38 +294,108 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     }
     raw = outcomes.flatMap((o) => o ?? []);
     failedPasses = outcomes.filter((o) => o === undefined).length;
+    if (failedPasses === units.length) throw new Error("All reviewers failed");
+
+    // ---- judge
+    findings = dedupeFindings(raw);
+    if (profile.useJudge && findings.length > 0) {
+      run.stage("judge", `Judging ${findings.length} candidate findings`, { raw: raw.length });
+      const before = findings.length;
+      findings = await runJudge(llm, settings, ctx, findings, signal).catch((err: Error) => {
+        log("judge failed, keeping deduped findings", { error: err.message });
+        run.log("warn", "Judge failed, keeping deduped findings", { error: err.message });
+        return findings;
+      });
+      run.log("info", `Judge kept ${findings.length} of ${before}`);
+    }
+
+    // The summary doesn't depend on findings, so it runs alongside the principal pass.
+    if (mode === "full" || summaryCommentId === undefined) {
+      summaryMarkdown = runSummary(llm, settings, pr, reviewFiles, ctx.prSummary, signal).catch((err: Error) => {
+        log("summary failed", { error: err.message });
+        run.log("warn", "Summary failed", { error: err.message });
+        return undefined;
+      });
+    }
+
+    // ---- principal
+    if (usePrincipal) {
+      run.stage("principal", `Principal pass over ${findings.length} findings`, { toolSteps: profile.principalSteps });
+      const startedAt = Date.now();
+      const failedUnits = units.flatMap((u, i) =>
+        outcomes[i] === undefined ? [{ kind: u.kind, files: u.files.map((f) => f.path) }] : [],
+      );
+      const diffStats = new Map(candidates.map((c) => [c.filename, c]));
+      const principalArgs = {
+        llm,
+        settings,
+        ctx,
+        files: reviewFiles.map((f) => ({
+          ...f,
+          additions: diffStats.get(f.path)?.additions,
+          deletions: diffStats.get(f.path)?.deletions,
+        })),
+        findings,
+        failedPasses: failedUnits,
+        patches,
+        allocate,
+        toolSteps: profile.principalSteps,
+        workspace,
+        guidelines: guidelines?.text,
+        signal,
+        log: (m: string) => {
+          log(m);
+          run.log("info", m, { reviewer: "principal" });
+        },
+      };
+      principal = await runPrincipal({ ...principalArgs, model: settings.model }).catch(async (err: Error) => {
+        if (signal?.aborted) throw err;
+        const fallback = settings.triageModel || settings.model;
+        run.log("warn", `Principal pass failed, retrying on ${fallback}`, { error: err.message });
+        return runPrincipal({ ...principalArgs, model: fallback }).catch((retryErr: Error) => {
+          if (signal?.aborted) throw retryErr;
+          log("principal failed", { error: retryErr.message });
+          run.log("error", "Principal pass failed, publishing the specialist review", { error: retryErr.message });
+          return undefined;
+        });
+      });
+      if (principal) {
+        run.log(
+          "info",
+          `Principal kept ${principal.kept.length}, dismissed ${principal.dismissed.length}, added ${principal.added.length + principal.outside.length}`,
+          { ms: Date.now() - startedAt, lookups: principal.toolCalls.length },
+        );
+        findings = [...principal.kept, ...principal.added];
+      }
+    }
   } finally {
     await workspace?.dispose();
   }
-  if (failedPasses === units.length) throw new Error("All reviewers failed");
 
-  // ---- judge + select
-  let findings = dedupeFindings(raw);
-  if (profile.useJudge && findings.length > 0) {
-    run.stage("judge", `Judging ${findings.length} candidate findings`, { raw: raw.length });
-    const before = findings.length;
-    findings = await runJudge(llm, settings, ctx, findings, signal).catch((err: Error) => {
-      log("judge failed, keeping deduped findings", { error: err.message });
-      run.log("warn", "Judge failed, keeping deduped findings", { error: err.message });
-      return findings;
-    });
-    run.log("info", `Judge kept ${findings.length} of ${before}`);
-  }
+  // ---- select
   const selected = selectFindings(findings, settings.minSeverity, settings.maxComments);
   // Nits don't deserve an inline notification each; they go in a collapsible list in the review body.
   const posted = selected.filter((f) => f.severity !== "nit");
   const nits = selected.filter((f) => f.severity === "nit");
-  run.stage("publish", `Publishing ${posted.length} comments`, { failedPasses });
+
+  // The verdict counts every surviving finding, not just the ones that fit the inline cap or the
+  // minSeverity filter: hiding a major from the inline view must not turn it into an approval.
+  const verdictFindings = principal
+    ? [...findings, ...principal.outside].sort((a, b) => severityRank(a.severity) - severityRank(b.severity))
+    : findings;
+  const verdict = principal ? deriveVerdict(verdictFindings, principal.questions.length) : undefined;
+  // REQUEST_CHANGES only from a complete review: a partial one can't vouch that it saw everything.
+  const event: ReviewEvent =
+    settings.requestChanges && failedPasses === 0 && (verdict === "REQUEST_CHANGES" || verdict === "BLOCK")
+      ? "REQUEST_CHANGES"
+      : "COMMENT";
+  run.stage("publish", `Publishing ${posted.length} comments${verdict ? `, verdict ${verdict}` : ""}`, { failedPasses, event });
 
   // ---- publish summary (always on full reviews, or if none exists yet)
-  let summaryCommentId = await state.getSummaryCommentId();
-  if (mode === "full" || summaryCommentId === undefined) {
+  const markdown = await summaryMarkdown;
+  if (markdown) {
     try {
-      const markdown = await runSummary(llm, settings, pr, reviewFiles, ctx.prSummary, signal);
-      summaryCommentId = await github.upsertSummaryComment(
-        renderSummaryComment(markdown, pr.headSha),
-        summaryCommentId,
-      );
+      summaryCommentId = await github.upsertSummaryComment(renderSummaryComment(markdown, pr.headSha), summaryCommentId);
     } catch (err) {
       log("summary failed", { error: (err as Error).message });
       run.log("warn", "Summary failed", { error: (err as Error).message });
@@ -310,23 +418,48 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     failedPasses,
     totalPasses: units.length,
   };
+  const body = (inline: Finding[]) => {
+    if (!principal || !verdict) return renderReviewBody({ ...stats, unplaced: posted.filter((f) => !inline.includes(f)) }, deps.mention);
+    const view: PrincipalView = {
+      report: principal,
+      verdict,
+      findings: verdictFindings,
+      inlineIds: new Set(inline.map((f) => f.id)),
+      files: {
+        additions: candidates.reduce((n, f) => n + f.additions, 0),
+        deletions: candidates.reduce((n, f) => n + f.deletions, 0),
+      },
+      baseSha: pr.baseSha,
+      guidelineFiles: guidelines?.files ?? [],
+    };
+    return renderPrincipalReviewBody(stats, view, deps.mention);
+  };
+
+  const publish = async (inline: Finding[], reviewEvent: ReviewEvent) =>
+    github.createReview({ commitId: pr.headSha, body: body(inline), comments: toReviewComments(inline), event: reviewEvent });
+
   try {
-    await github.createReview({
-      commitId: pr.headSha,
-      body: renderReviewBody(stats, deps.mention),
-      comments: toReviewComments(posted),
-    });
+    await publish(posted, event);
   } catch (err) {
-    // 422 means GitHub rejected an inline position. Fall back to listing
-    // every finding in the review body so nothing is lost.
+    // 422 means GitHub rejected an inline position, or (on our own PRs) a
+    // REQUEST_CHANGES event. Retry as a plain comment with every finding in
+    // the body so nothing is lost.
     if ((err as { status?: number }).status !== 422) throw err;
-    log("inline comments rejected, posting findings in review body");
-    run.log("warn", "GitHub rejected inline comments, posted findings in the review body");
-    await github.createReview({
-      commitId: pr.headSha,
-      body: renderReviewBody({ ...stats, unplaced: posted }, deps.mention),
-      comments: [],
-    });
+    log("review rejected (422), posting findings in review body", { event });
+    run.log("warn", "GitHub rejected the review (422), posted it as a comment with findings in the body", { event });
+    await publish([], "COMMENT");
+  }
+
+  // A COMMENT review does not clear our earlier REQUEST_CHANGES, so clear it
+  // ourselves once a complete review no longer requests changes.
+  if (settings.requestChanges && event === "COMMENT" && verdict && failedPasses === 0) {
+    const dismissed = await github
+      .dismissStaleChangeRequests(`Superseded by OwnRabbit review of ${pr.headSha.slice(0, 7)} (${verdict.replace(/_/g, " ")}).`)
+      .catch((err: Error) => {
+        run.log("warn", "Could not dismiss earlier change requests", { error: err.message });
+        return 0;
+      });
+    if (dismissed > 0) run.log("info", `Dismissed ${dismissed} earlier change request(s)`);
   }
 
   // A partial review must not advance the incremental cursor, or the files
@@ -342,6 +475,7 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     findingsRaw: raw.length,
     commentsPosted: posted.length + nits.length,
     failedPasses,
+    ...(verdict ? { verdict } : {}),
   };
 }
 

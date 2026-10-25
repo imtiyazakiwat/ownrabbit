@@ -84,15 +84,52 @@ export function createGitHubPort(args: {
       return data.id;
     },
 
-    async createReview({ commitId, body, comments }) {
+    async createReview({ commitId, body, comments, event = "COMMENT" }) {
       await octokit.rest.pulls.createReview({
         ...base,
         pull_number: prNumber,
         commit_id: commitId,
-        event: "COMMENT",
+        event,
         body,
         comments,
       });
+    },
+
+    async dismissStaleChangeRequests(message: string): Promise<number> {
+      let dismissed = 0;
+      for await (const page of octokit.paginate.iterator(octokit.rest.pulls.listReviews, {
+        ...base,
+        pull_number: prNumber,
+        per_page: 100,
+      })) {
+        for (const review of page.data) {
+          if (review.state !== "CHANGES_REQUESTED" || review.user?.login !== botLogin) continue;
+          await octokit.rest.pulls.dismissReview({ ...base, pull_number: prNumber, review_id: review.id, message });
+          dismissed++;
+        }
+      }
+      return dismissed;
+    },
+
+    async readFile(path: string, ref: string): Promise<string | undefined> {
+      try {
+        const { data } = await octokit.rest.repos.getContent({ ...base, path, ref });
+        if (Array.isArray(data) || data.type !== "file" || !("content" in data)) return undefined;
+        return Buffer.from(data.content, "base64").toString("utf8");
+      } catch (err) {
+        if ((err as { status?: number }).status === 404) return undefined;
+        throw err;
+      }
+    },
+
+    async listDir(dir: string, ref: string): Promise<string[]> {
+      try {
+        const { data } = await octokit.rest.repos.getContent({ ...base, path: dir, ref });
+        return Array.isArray(data) ? data.filter((e) => e.type === "file").map((e) => e.name) : [];
+      } catch (err) {
+        if ((err as { status?: number }).status === 404) return [];
+        throw err;
+      }
     },
   };
 }
