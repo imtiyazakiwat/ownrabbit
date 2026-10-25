@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <!-- OwnRabbit avatar: a rabbit whose ears are diff markers, "+" (green) and "-" (red). -->
+  <rect width="512" height="512" rx="112" fill="#0f0e0c"/>
+  <!-- ears -->
+  <g stroke-linecap="round" stroke-width="46">
+    <path d="M178 70v170" stroke="#8fd694"/>
+    <path d="M118 140h120" stroke="#8fd694"/>
+    <path d="M334 70v170" stroke="#ff8a7a" transform="rotate(14 334 240)"/>
+  </g>
+  <!-- head -->
+  <ellipse cx="256" cy="342" rx="156" ry="118" fill="#ff7a1a"/>
+  <!-- eyes: half-closed, reading -->
+  <rect x="178" y="314" width="48" height="18" rx="9" fill="#0f0e0c"/>
+  <rect x="286" y="314" width="48" height="18" rx="9" fill="#0f0e0c"/>
+  <!-- nose -->
+  <path d="M238 374h36l-18 20z" fill="#0f0e0c"/>
+</svg>

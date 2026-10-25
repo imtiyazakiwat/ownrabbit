@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isValidRange, nearestCommentableLine, parsePatch, renderNumberedPatch } from "./diff";
+import { isValidRange, locateSnippet, nearestCommentableLine, parsePatch, renderNumberedPatch, snippetMatches } from "./diff";
 
 const PATCH = [
   "@@ -1,4 +1,5 @@",
@@ -50,5 +50,27 @@ describe("parsePatch", () => {
     expect(text).toContain("   2 +const x = 2;");
     expect(text).toContain("     -const x = 1;");
     expect(text).toContain("  22 +  // added");
+  });
+});
+
+describe("snippet anchoring", () => {
+  const parsed = parsePatch(PATCH);
+
+  it("locates a quote regardless of indentation and across blank lines", () => {
+    expect(locateSnippet(parsed, "const y = 3;")).toEqual({ startLine: 3, line: 3 });
+    expect(locateSnippet(parsed, "  const x = 2;\nconst y = 3;")).toEqual({ startLine: 2, line: 3 });
+    expect(locateSnippet(parsed, "const y = 3;\nexport { x };")).toEqual({ startLine: 3, line: 5 });
+  });
+
+  it("never matches deleted lines or text that isn't in the diff", () => {
+    expect(locateSnippet(parsed, "const x = 1;")).toBeUndefined();
+    expect(locateSnippet(parsed, "totally invented")).toBeUndefined();
+    expect(locateSnippet(parsed, "   \n  ")).toBeUndefined();
+  });
+
+  it("checks a quote against the cited range", () => {
+    expect(snippetMatches(parsed, "const x = 2;", 2, 2)).toBe(true);
+    expect(snippetMatches(parsed, "const x = 2;", 3, 3)).toBe(false);
+    expect(snippetMatches(parsed, "const x = 2;", 9, 9)).toBe(false);
   });
 });

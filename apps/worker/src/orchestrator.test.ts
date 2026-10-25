@@ -32,10 +32,13 @@ const FILES: ChangedFile[] = [
 ];
 
 /** Routes by system prompt so each stage gets a deterministic reply. */
-function fakeLlm(overrides: { reviewer?: unknown; judge?: unknown; fail?: RegExp } = {}): LlmClient & {
+function fakeLlm(
+  overrides: { reviewer?: unknown; judge?: unknown; principal?: unknown | unknown[]; fail?: RegExp } = {},
+): LlmClient & {
   calls: ChatOptions[];
 } {
   const calls: ChatOptions[] = [];
+  let principalStep = 0;
   const respond = (options: ChatOptions): unknown => {
     const system = options.messages[0]?.content ?? "";
     if (overrides.fail?.test(system)) throw new Error("boom");
@@ -43,6 +46,11 @@ function fakeLlm(overrides: { reviewer?: unknown; judge?: unknown; fail?: RegExp
       return { summary: "Adds a query helper.", files: [{ path: "src/db.ts", summary: "query", risk: "high" }] };
     }
     if (system.includes("final quality gate")) return overrides.judge ?? { verdicts: [{ id: 1, keep: true }] };
+    if (system.includes("principal reviewer")) {
+      // An array scripts a multi-turn agent run; each call takes the next step.
+      if (Array.isArray(overrides.principal)) return overrides.principal[principalStep++] ?? { action: "final" };
+      return overrides.principal ?? { action: "final", verdictReason: "ok" };
+    }
     if (system.includes("summary comment")) return { markdown: "## Walkthrough\nAdds q()." };
     return (
       overrides.reviewer ?? {
@@ -80,10 +88,24 @@ function fakeLlm(overrides: { reviewer?: unknown; judge?: unknown; fail?: RegExp
   };
 }
 
-function fakeGitHub(overrides: Partial<GitHubPort> = {}) {
+function fakeGitHub(overrides: Partial<GitHubPort> = {}, repoFiles: Record<string, string> = {}) {
   const reviews: Parameters<GitHubPort["createReview"]>[0][] = [];
   const summaries: string[] = [];
+  const dismissals: string[] = [];
+  const reads: { path: string; ref: string }[] = [];
   const port: GitHubPort = {
+    readFile: async (path, ref) => {
+      reads.push({ path, ref });
+      return repoFiles[path];
+    },
+    listDir: async (dir) =>
+      Object.keys(repoFiles)
+        .filter((p) => p.startsWith(`${dir}/`) && !p.slice(dir.length + 1).includes("/"))
+        .map((p) => p.slice(dir.length + 1)),
+    dismissStaleChangeRequests: async (message) => {
+      dismissals.push(message);
+      return 1;
+    },
     getPullRequest: async () => ({ number: 3, state: "open", title: "Add q", body: "", headSha: HEAD, baseSha: OLD }),
     listPullRequestFiles: async () => FILES,
     compareFiles: async () => ["src/db.ts"],
@@ -96,7 +118,7 @@ function fakeGitHub(overrides: Partial<GitHubPort> = {}) {
     },
     ...overrides,
   };
-  return { port, reviews, summaries };
+  return { port, reviews, summaries, dismissals, reads };
 }
 
 function fakeState(lastReviewedSha?: string): StatePort & { saved: unknown[] } {
@@ -115,6 +137,7 @@ const settings = (o: Partial<RepoSettings> = {}): RepoSettings => ({
   ...defaultSettings(),
   reviewers: ["security"],
   depth: "standard",
+  principalReview: false,
   ...o,
 });
 
@@ -163,6 +186,16 @@ describe("runReviewPipeline", () => {
     expect(state.saved.at(-1)).toEqual({ lastReviewedSha: HEAD, summaryCommentId: 42 });
   });
 
+  it("reports each stage to the run monitor", async () => {
+    const stages: string[] = [];
+    const errors: string[] = [];
+    const run = { stage: (name: string) => void stages.push(name), log: (level: string, m: string) => void (level === "error" && errors.push(m)) };
+    const multi = settings({ reviewers: ["security", "bugs"] });
+    await runReviewPipeline({ ...deps({ settings: multi, llm: fakeLlm({ fail: /focus: correctness/ }) }), run });
+    expect(stages).toEqual(["load", "triage", "review", "judge", "publish"]);
+    expect(errors.some((m) => m.startsWith("bugs failed"))).toBe(true);
+  });
+
   it("never sends lockfiles to reviewers", async () => {
     const llm = fakeLlm();
     await runReviewPipeline(deps({ llm }));
@@ -176,6 +209,13 @@ describe("runReviewPipeline", () => {
     const result = await runReviewPipeline(deps({ llm, github: gh.port }));
     expect(result).toMatchObject({ status: "completed", commentsPosted: 0 });
     expect(gh.reviews[0]!.body).toContain("No issues found");
+  });
+
+  it("uses the judge score over its keep flag", async () => {
+    const low = fakeLlm({ judge: { verdicts: [{ id: 1, keep: true, score: 4 }] } });
+    expect(await runReviewPipeline(deps({ llm: low }))).toMatchObject({ commentsPosted: 0 });
+    const high = fakeLlm({ judge: { verdicts: [{ id: 1, keep: false, score: 9 }] } });
+    expect(await runReviewPipeline(deps({ llm: high }))).toMatchObject({ commentsPosted: 1 });
   });
 
   it("keeps findings if the judge itself fails", async () => {
@@ -243,7 +283,8 @@ describe("runReviewPipeline", () => {
     const body = gh.reviews[0]!.body;
     expect(body).toContain("Partial review");
     expect(body).toContain("1 of 2 reviewer passes failed");
-    expect(state.saved.every((s) => (s as { lastReviewedSha?: string }).lastReviewedSha === undefined)).toBe(true);
+    // Only the summary id is persisted; the cursor stays put.
+    expect(state.saved).toEqual([{ summaryCommentId: 42 }]);
   });
 
   it("retries a transiently failing reviewer pass once", async () => {
@@ -263,6 +304,168 @@ describe("runReviewPipeline", () => {
   it("quick depth never creates a workspace", async () => {
     const d = { ...deps({ settings: settings({ depth: "quick" }) }), createWorkspace: noWorkspace };
     expect((await runReviewPipeline(d)).status).toBe("completed");
+  });
+
+  describe("principal pass", () => {
+    const on = (o: Partial<RepoSettings> = {}) => settings({ principalReview: true, ...o });
+
+    it("writes a playbook review and requests changes when a critical finding survives", async () => {
+      const gh = fakeGitHub();
+      const llm = fakeLlm({
+        principal: {
+          action: "final",
+          // The model says approve; the surviving critical finding must win.
+          verdict: "APPROVE",
+          verdictReason: "Adds a query helper with an injection.",
+          risks: [{ area: "Security", rating: "high", reason: "raw SQL | interpolation" }],
+          findingNotes: [{ id: 1, impact: "Any row readable.", steelman: "ids may be numeric.", confidence: "confirmed" }],
+          traced: ["q() callers pass req.query.id"],
+          notVerified: [{ item: "DB driver escaping", how: "check run() source" }],
+        },
+      });
+      const result = await runReviewPipeline(deps({ llm, github: gh.port, settings: on() }));
+
+      expect(result).toMatchObject({ status: "completed", verdict: "BLOCK", commentsPosted: 1 });
+      const review = gh.reviews[0]!;
+      expect(review.event).toBe("REQUEST_CHANGES");
+      expect(review.body).toContain("⛔ BLOCK");
+      expect(review.body).toContain("the reviewer model suggested APPROVE");
+      expect(review.body).toContain("| Security | **High** | raw SQL \\| interpolation |");
+      expect(review.body).toContain("**Steelman:** ids may be numeric.");
+      expect(review.body).toContain("Confirmed by tracing");
+      expect(review.body).toContain("| DB driver escaping | check run() source |");
+      // Always admits nothing was run.
+      expect(review.body).toContain("Nothing was built, run, or tested");
+      expect(review.comments[0]!.body).toContain("**Impact:** Any row readable.");
+      expect(gh.dismissals).toEqual([]);
+    });
+
+    it("drops a finding the principal disproves with a reason, approves, and clears old change requests", async () => {
+      const gh = fakeGitHub();
+      const llm = fakeLlm({
+        principal: { action: "final", findingNotes: [{ id: 1, dismiss: true, dismissReason: "id is parsed as int upstream" }] },
+      });
+      const result = await runReviewPipeline(deps({ llm, github: gh.port, settings: on() }));
+      expect(result).toMatchObject({ verdict: "APPROVE", commentsPosted: 0 });
+      expect(gh.reviews[0]!.event).toBe("COMMENT");
+      expect(gh.reviews[0]!.body).toContain("~~SQL injection via id~~");
+      expect(gh.dismissals).toHaveLength(1);
+    });
+
+    it("ignores a dismissal without a reason", async () => {
+      const llm = fakeLlm({ principal: { action: "final", findingNotes: [{ id: 1, dismiss: true }] } });
+      expect(await runReviewPipeline(deps({ llm, settings: on() }))).toMatchObject({ verdict: "BLOCK" });
+    });
+
+    it("keeps outside-diff findings only for files it actually opened, and caps 'possible' below critical", async () => {
+      const outsideFinding = (path: string) => ({
+        path,
+        line: 20,
+        severity: "critical",
+        category: "shutdown",
+        title: `no drain in ${path}`,
+        body: "b",
+        confidence: 0.9,
+        confidenceLabel: "possible",
+      });
+      const gh = fakeGitHub();
+      const llm = fakeLlm({
+        judge: { verdicts: [{ id: 1, keep: false, score: 0 }] },
+        principal: [
+          { action: "read_file", path: "src/main.ts" },
+          { action: "final", additionalFindings: [outsideFinding("src/main.ts"), outsideFinding("src/never-opened.ts")] },
+        ],
+      });
+      const result = await runReviewPipeline(deps({ llm, github: gh.port, settings: on() }));
+      const body = gh.reviews[0]!.body;
+      expect(body).toContain("no drain in src/main.ts");
+      expect(body).not.toContain("never-opened");
+      // "possible" can't block: critical is capped to major, so the verdict is REQUEST_CHANGES.
+      expect(result).toMatchObject({ verdict: "REQUEST_CHANGES" });
+      expect(body).toContain("🟠 Major: no drain in src/main.ts");
+      expect(body).toContain("`read_file` `src/main.ts`");
+    });
+
+    it("counts findings hidden by minSeverity toward the verdict", async () => {
+      const gh = fakeGitHub();
+      const result = await runReviewPipeline(deps({ github: gh.port, settings: on({ minSeverity: "nit", maxComments: 1 }) }));
+      expect(result).toMatchObject({ verdict: "BLOCK" });
+    });
+
+    it("never requests changes on a partial review", async () => {
+      const gh = fakeGitHub();
+      const llm = fakeLlm({ fail: /focus: correctness/ });
+      await runReviewPipeline(deps({ llm, github: gh.port, settings: on({ reviewers: ["security", "bugs"] }) }));
+      expect(gh.reviews[0]!.event).toBe("COMMENT");
+      expect(gh.reviews[0]!.body).toContain("Partial review");
+      expect(gh.dismissals).toEqual([]);
+    });
+
+    it("respects requestChanges: false", async () => {
+      const gh = fakeGitHub();
+      await runReviewPipeline(deps({ github: gh.port, settings: on({ requestChanges: false }) }));
+      expect(gh.reviews[0]!.event).toBe("COMMENT");
+      expect(gh.reviews[0]!.body).toContain("⛔ BLOCK");
+    });
+
+    it("falls back to a COMMENT review when GitHub rejects REQUEST_CHANGES", async () => {
+      const posted: Parameters<GitHubPort["createReview"]>[0][] = [];
+      const gh = fakeGitHub({
+        createReview: async (review) => {
+          if (review.event === "REQUEST_CHANGES") throw Object.assign(new Error("Can not request changes on your own pull request"), { status: 422 });
+          posted.push(review);
+        },
+      });
+      await runReviewPipeline(deps({ github: gh.port, settings: on() }));
+      expect(posted).toHaveLength(1);
+      expect(posted[0]).toMatchObject({ event: "COMMENT", comments: [] });
+      expect(posted[0]!.body).toContain("SQL injection via id");
+    });
+
+    it("publishes the specialist review if the principal fails on both models", async () => {
+      const gh = fakeGitHub();
+      const llm = fakeLlm({ fail: /principal reviewer/ });
+      const result = await runReviewPipeline(deps({ llm, github: gh.port, settings: on() }));
+      expect(result).toMatchObject({ status: "completed", commentsPosted: 1 });
+      expect(result).not.toHaveProperty("verdict");
+      expect(gh.reviews[0]!.event).toBe("COMMENT");
+    });
+
+    it("quick depth skips the principal pass", async () => {
+      const llm = fakeLlm();
+      const d = { ...deps({ llm, settings: on({ depth: "quick" }) }), createWorkspace: noWorkspace };
+      await runReviewPipeline(d);
+      expect(llm.calls.some((c) => c.messages[0]!.content.includes("principal reviewer"))).toBe(false);
+    });
+  });
+
+  describe("repository guidelines", () => {
+    it("loads guideline files from the base commit and gives them to reviewers and the principal", async () => {
+      const gh = fakeGitHub({}, {
+        "AGENTS.md": "Always use parameterized queries.",
+        ".kiro/steering/behavioral-guidelines.md": "Surgical changes only.",
+        ".kiro/steering/image.png": "binary",
+      });
+      const llm = fakeLlm();
+      await runReviewPipeline(deps({ llm, github: gh.port, settings: settings({ principalReview: true }) }));
+
+      expect(gh.reads.every((r) => r.ref === OLD)).toBe(true);
+      const systems = llm.calls.map((c) => c.messages[0]!.content);
+      const reviewer = systems.find((s) => s.includes("Your focus"))!;
+      const principal = systems.find((s) => s.includes("principal reviewer"))!;
+      for (const s of [reviewer, principal]) {
+        expect(s).toContain("Always use parameterized queries.");
+        expect(s).toContain("Surgical changes only.");
+      }
+      expect(gh.reads.some((r) => r.path.endsWith(".png"))).toBe(false);
+      expect(gh.reviews[0]!.body).toContain("Repository guideline: `AGENTS.md`");
+    });
+
+    it("skips guidelines when disabled", async () => {
+      const gh = fakeGitHub({}, { "AGENTS.md": "x" });
+      await runReviewPipeline(deps({ github: gh.port, settings: settings({ useRepoGuidelines: false }) }));
+      expect(gh.reads).toEqual([]);
+    });
   });
 
   it("runs the tool loop and disposes the workspace", async () => {

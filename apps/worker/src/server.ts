@@ -21,6 +21,7 @@ import { createLlmClient } from "./llm";
 import { runReviewPipeline, type StatePort } from "./orchestrator";
 import { renderFailureComment } from "./publish";
 import { createLazyWorkspace } from "./repo";
+import { createRunLog, type RunSink } from "./runlog";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const MAX_BODY = 64 * 1024;
@@ -124,6 +125,26 @@ function createStatePort(job: ReviewJob): StatePort {
   };
 }
 
+/** Events go to reviews/{jobId}/events; the parent doc carries the live stage for list views. */
+function firestoreSink(jobId: string): RunSink {
+  const reviewRef = db().collection(collections.reviews).doc(jobId);
+  return {
+    async write(events, stage) {
+      const batch = db().batch();
+      for (const event of events) {
+        batch.set(reviewRef.collection("events").doc(String(event.seq).padStart(4, "0")), event);
+      }
+      const last = events.at(-1);
+      batch.set(
+        reviewRef,
+        { stage, eventCount: last?.seq, lastMessage: last?.message, heartbeatAt: FieldValue.serverTimestamp() },
+        { merge: true },
+      );
+      await batch.commit();
+    },
+  };
+}
+
 async function installationToken(octokit: Awaited<ReturnType<typeof installationOctokit>>): Promise<string> {
   const auth = (await octokit.auth({ type: "installation" })) as { token: string };
   return auth.token;
@@ -138,6 +159,8 @@ async function handleReview(job: ReviewJob): Promise<number> {
   const started = Date.now();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("Review timed out")), JOB_TIMEOUT_MS);
+  const run = createRunLog(firestoreSink(job.jobId));
+  run.stage("start", `Worker picked up ${job.trigger} ${job.mode} review`, { sha: job.headSha.slice(0, 7) });
 
   const { settings } = await getRepoSettings(job.repoId);
   const octokit = await installationOctokit(job.installationId);
@@ -156,7 +179,12 @@ async function handleReview(job: ReviewJob): Promise<number> {
         .catch(() => undefined);
     }
 
-    const llm = createLlmClient({ baseUrl: config.llmBaseUrl, apiKey: config.llmApiKey });
+    const llm = createLlmClient({
+      baseUrl: config.llmBaseUrl,
+      apiKey: config.llmApiKey,
+      onRetry: ({ attempt, delayMs, error }) =>
+        run.log("warn", `Model call failed, retry ${attempt} in ${Math.round(delayMs / 1000)}s`, { error }),
+    });
     const result = await runReviewPipeline({
       job,
       settings,
@@ -165,6 +193,9 @@ async function handleReview(job: ReviewJob): Promise<number> {
       llm,
       mention: mentionHandle(),
       signal: controller.signal,
+      // Leave the last 30% of the deadline for judge, summary, and publishing.
+      reviewBudgetMs: Math.round(JOB_TIMEOUT_MS * 0.7),
+      run,
       createWorkspace: (sha) =>
         createLazyWorkspace({
           owner: job.owner,
@@ -176,6 +207,14 @@ async function handleReview(job: ReviewJob): Promise<number> {
       log: (message, extra) => log(message, { jobId: job.jobId, ...extra }),
     });
 
+    run.stage(
+      result.status === "skipped" ? "skipped" : "done",
+      result.status === "skipped"
+        ? `Skipped: ${result.reason}`
+        : `Done: ${result.commentsPosted} comments on ${result.filesReviewed} files`,
+      { tokensUsed: llm.tokensUsed, ms: Date.now() - started },
+    );
+    await run.close();
     await reviewRef.set(
       {
         status: result.status,
@@ -185,6 +224,7 @@ async function handleReview(job: ReviewJob): Promise<number> {
               filesReviewed: result.filesReviewed,
               findingsRaw: result.findingsRaw,
               commentsPosted: result.commentsPosted,
+              failedPasses: result.failedPasses,
             }),
         tokensUsed: llm.tokensUsed,
         durationMs: Date.now() - started,
@@ -197,6 +237,8 @@ async function handleReview(job: ReviewJob): Promise<number> {
   } catch (err) {
     const message = (err as Error).message ?? String(err);
     logError("review failed", { jobId: job.jobId, error: message, stack: (err as Error).stack });
+    run.stage("failed", "Review failed", { error: message.slice(0, 500) });
+    await run.close();
     await reviewRef.set(
       { status: "failed", error: message.slice(0, 500), durationMs: Date.now() - started, updatedAt: FieldValue.serverTimestamp() },
       { merge: true },

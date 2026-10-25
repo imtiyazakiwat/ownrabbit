@@ -35,23 +35,26 @@ export type Depth = (typeof DEPTHS)[number];
 /** How much agentic work each depth allows. */
 export const DEPTH_PROFILES: Record<
   Depth,
-  { toolSteps: number; useJudge: boolean; label: string; description: string }
+  { toolSteps: number; useJudge: boolean; principalSteps: number; label: string; description: string }
 > = {
   quick: {
     toolSteps: 0,
     useJudge: false,
+    principalSteps: 0,
     label: "Quick",
     description: "Diff only. Fastest, cheapest, catches obvious issues.",
   },
   standard: {
     toolSteps: 4,
     useJudge: true,
+    principalSteps: 3,
     label: "Standard",
     description: "Reviewers can open a few related files. A judge pass removes noise.",
   },
   deep: {
     toolSteps: 10,
     useJudge: true,
+    principalSteps: 8,
     label: "Deep",
     description: "Reviewers explore the codebase (callers, types, configs) before commenting.",
   },
@@ -105,6 +108,12 @@ export const RepoSettingsSchema = z.object({
   includePaths: z.array(glob).max(50).default([]),
   excludePaths: z.array(glob).max(50).default(DEFAULT_EXCLUDES),
   customRules: z.string().max(8000).default(""),
+  /** Principal pass: verdict, risk summary, dimension sweep, verification log. Needs a judged depth. */
+  principalReview: z.boolean().default(true),
+  /** Post REQUEST_CHANGES when the verdict is REQUEST CHANGES or BLOCK. OwnRabbit never approves. */
+  requestChanges: z.boolean().default(true),
+  /** Read review rules committed on the base branch (.ownrabbit/review.md, AGENTS.md, .kiro/steering, ...). */
+  useRepoGuidelines: z.boolean().default(true),
   tone: z.enum(TONES).default("concise"),
   model: modelId.default(DEFAULT_MODEL),
   triageModel: modelId.default(DEFAULT_TRIAGE_MODEL),

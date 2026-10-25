@@ -237,6 +237,29 @@ export function SettingsForm({
                   : "diff only",
               }))}
             />
+            <div className="mt-5 grid gap-3 sm:grid-cols-2">
+              <Toggle
+                small
+                checked={s.principalReview}
+                onChange={(v) => set("principalReview", v)}
+                label="Principal pass: verdict, risk table, verification log"
+              />
+              <Toggle
+                small
+                checked={s.requestChanges}
+                onChange={(v) => set("requestChanges", v)}
+                label="Request changes on blocking findings"
+              />
+              <Toggle
+                small
+                checked={s.useRepoGuidelines}
+                onChange={(v) => set("useRepoGuidelines", v)}
+                label="Follow repo guidelines (AGENTS.md, .ownrabbit/review.md)"
+              />
+            </div>
+            {s.depth === "quick" && s.principalReview && (
+              <p className="mt-2 text-[11px] text-dim">The principal pass runs at Standard and Deep only.</p>
+            )}
           </Section>
 
           <Section id="reviewers" n={5} title="Sub-reviewers" hint="Each specialist runs in parallel with its own brief, then a judge merges their findings.">

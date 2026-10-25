@@ -101,6 +101,60 @@ export function isValidRange(parsed: ParsedPatch, line: number, startLine?: numb
   return parsed.commentable.get(startLine) === endHunk;
 }
 
+const normalize = (s: string) => s.replace(/\s+/g, " ").trim();
+
+/** Text of new-file lines in [start, end], or undefined if any line is not in the diff. */
+export function textOfRange(parsed: ParsedPatch, start: number, end: number): string | undefined {
+  const byLine = new Map<number, string>();
+  for (const hunk of parsed.hunks) for (const l of hunk.lines) if (l.newLine !== undefined) byLine.set(l.newLine, l.text);
+  const out: string[] = [];
+  for (let n = start; n <= end; n++) {
+    const text = byLine.get(n);
+    if (text === undefined) return undefined;
+    out.push(text);
+  }
+  return out.join("\n");
+}
+
+/**
+ * Find where a quoted snippet actually lives in the diff (whitespace-insensitive,
+ * within one hunk, non-deleted lines). Models cite line numbers loosely but quote
+ * code accurately, so the quote is the better anchor.
+ */
+export function locateSnippet(parsed: ParsedPatch, snippet: string): { startLine: number; line: number } | undefined {
+  const wanted = snippet.split("\n").map(normalize).filter(Boolean);
+  if (wanted.length === 0) return undefined;
+  for (const hunk of parsed.hunks) {
+    const lines = hunk.lines.filter((l) => l.newLine !== undefined);
+    for (let i = 0; i + wanted.length <= lines.length; i++) {
+      let j = 0;
+      let k = i;
+      // Skip blank lines inside the hunk so a quote without them still matches.
+      while (j < wanted.length && k < lines.length) {
+        const text = normalize(lines[k]!.text);
+        if (!text && k > i) {
+          k++;
+          continue;
+        }
+        if (text !== wanted[j]) break;
+        j++;
+        k++;
+      }
+      if (j === wanted.length) return { startLine: lines[i]!.newLine!, line: lines[k - 1]!.newLine! };
+    }
+  }
+  return undefined;
+}
+
+/** True when `snippet` matches the cited lines, ignoring whitespace differences. */
+export function snippetMatches(parsed: ParsedPatch, snippet: string, start: number, end: number): boolean {
+  const actual = textOfRange(parsed, start, end);
+  if (actual === undefined) return false;
+  const a = actual.split("\n").map(normalize).filter(Boolean).join("\n");
+  const w = snippet.split("\n").map(normalize).filter(Boolean).join("\n");
+  return w.length > 0 && (a === w || a.includes(w));
+}
+
 /** Nearest commentable line within `radius`, preferring added lines. Used to repair off-by-a-few citations. */
 export function nearestCommentableLine(
   parsed: ParsedPatch,
