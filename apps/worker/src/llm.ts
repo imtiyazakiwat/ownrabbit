@@ -15,6 +15,8 @@ export interface ChatOptions {
   model: string;
   messages: ChatMessage[];
   temperature?: number;
+  /** Output budget. Defaults high because the backend's own default (2048) truncates JSON replies. */
+  maxTokens?: number;
   timeoutMs?: number;
   signal?: AbortSignal;
 }
@@ -38,6 +40,8 @@ export class LlmError extends Error {
     this.name = "LlmError";
   }
 }
+
+export const DEFAULT_MAX_TOKENS = 16_384;
 
 const ResponseSchema = z.object({
   choices: z
@@ -89,6 +93,7 @@ export function createLlmClient(config: LlmConfig): LlmClient {
           model: options.model,
           messages: options.messages,
           temperature: options.temperature ?? 0.2,
+          max_tokens: options.maxTokens ?? DEFAULT_MAX_TOKENS,
           ...(json ? { response_format: { type: "json_object" } } : {}),
         }),
       });

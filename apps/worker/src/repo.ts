@@ -19,6 +19,8 @@ const MAX_SEARCH_RESULTS = 60;
 const MAX_TOOL_OUTPUT = 12_000;
 
 export interface Workspace {
+  /** Absolute checkout path, for processes that must run inside the repository. */
+  root(): Promise<string>;
   readFile(file: string, startLine?: number, endLine?: number): Promise<string>;
   search(pattern: string, glob?: string): Promise<string>;
   listDir(dir: string): Promise<string>;
@@ -63,6 +65,10 @@ export function createLazyWorkspace(options: CheckoutOptions): Workspace {
   }
 
   return {
+    async root() {
+      return ensure();
+    },
+
     async readFile(file, startLine, endLine) {
       const full = await resolveInside(file);
       const info = await stat(full);

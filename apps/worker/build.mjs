@@ -10,8 +10,8 @@ await rm("dist", { recursive: true, force: true });
 await mkdir("dist", { recursive: true });
 
 await build({
-  entryPoints: ["src/server.ts"],
-  outfile: "dist/server.js",
+  entryPoints: ["src/server.ts", "src/mcp-review.ts"],
+  outdir: "dist",
   bundle: true,
   platform: "node",
   target: "node22",

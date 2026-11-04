@@ -27,6 +27,7 @@ const STATUS_STYLE: Record<string, { dot: string; text: string }> = {
   running: { dot: "bg-warn animate-pulse", text: "text-warn" },
   completed: { dot: "bg-add", text: "text-add" },
   skipped: { dot: "bg-dim", text: "text-dim" },
+  paused: { dot: "bg-warn", text: "text-warn" },
   failed: { dot: "bg-del", text: "text-del" },
 };
 
@@ -316,7 +317,7 @@ function RunDetail({ summary, now }: { summary: RunSummary; now: number }) {
 
         {(run.error || run.reason) && (
           <p className={`mt-3 border px-3 py-2 text-xs ${run.error ? "border-del/40 bg-del-bg text-del" : "border-line text-muted"}`}>
-            {run.error ? `Error: ${run.error}` : `Skipped: ${run.reason}`}
+            {run.error ? `Error: ${run.error}` : `${run.status === "paused" ? "Paused" : "Skipped"}: ${run.reason}`}
           </p>
         )}
         {stale && (
@@ -419,7 +420,7 @@ function LogLine({ event, t0 }: { event: RunEventRow; t0: number }) {
 }
 
 function StageRail({ run, stale }: { run: RunSummary; stale: boolean }) {
-  const terminal = run.status === "completed" || run.status === "skipped";
+  const terminal = run.status === "completed" || run.status === "skipped" || run.status === "paused";
   const failed = run.status === "failed";
   const currentIdx = terminal ? STAGES.length - 1 : STAGES.findIndex((s) => s.key === run.stage);
   return (
@@ -437,7 +438,7 @@ function StageRail({ run, stale }: { run: RunSummary; stale: boolean }) {
         return (
           <li key={stage.key} className="flex min-w-0 flex-1 items-center gap-1" aria-current={isCurrent ? "step" : undefined}>
             <span className={`flex-1 truncate border-t-2 pt-1 text-center text-[10px] tracking-wider uppercase ${tone}`}>
-              {stage.key === "done" && run.status === "skipped" ? "Skipped" : stage.label}
+              {stage.key === "done" && run.status === "skipped" ? "Skipped" : stage.key === "done" && run.status === "paused" ? "Paused" : stage.label}
               {isCurrent && !failed && !stale && <span className="ml-1 animate-pulse">●</span>}
             </span>
           </li>

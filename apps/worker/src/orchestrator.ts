@@ -29,6 +29,8 @@ import {
 
 export type ReviewEvent = "COMMENT" | "REQUEST_CHANGES";
 import { loadGuidelines, type GuidelineSource, type Guidelines } from "./guidelines";
+import { buildReviewPrompt } from "./opencode-prompt";
+import { runOpenCodeReview as runOpenCodeAgent, sanitizeCheckout } from "./opencode";
 import { deriveVerdict, runPrincipal, type PrincipalReport, type Verdict } from "./principal";
 import { runReviewer, type ReviewContext, type ReviewFile } from "./reviewer";
 import type { Workspace } from "./repo";
@@ -105,9 +107,46 @@ export type PipelineResult =
       findingsRaw: number;
       commentsPosted: number;
       failedPasses: number;
-      /** Present when the principal pass ran. */
+      /** Present when the principal pass ran, or opencode derived one. */
       verdict?: Verdict;
+      usage?: {
+        input: number;
+        output: number;
+        reasoning: number;
+        cacheRead: number;
+        cacheWrite: number;
+        costUsd: number;
+        model: string;
+      };
     };
+
+export interface OpenCodePipelineDeps {
+  job: ReviewJob;
+  settings: RepoSettings;
+  github: GitHubPort;
+  state: StatePort;
+  platformDefault: string;
+  opencodeApiKey: string;
+  createWorkspace: (sha: string) => Workspace;
+  getGithubToken: () => Promise<string>;
+  mention: string;
+  botLogin: string;
+  signal?: AbortSignal;
+  log: (msg: string, extra?: Record<string, unknown>) => void;
+  reviewBudgetMs?: number;
+  run?: Pick<RunLog, "stage" | "log">;
+}
+
+interface PreparedOpenCode {
+  pr: PullRequest;
+  mode: "full" | "incremental";
+  files: ChangedFile[];
+  filesSkipped: number;
+  scopeTruncated: boolean;
+  lastReviewedSha?: string;
+  summaryCommentId?: number;
+  guidelines?: Guidelines;
+}
 
 // ------------------------------------------------------------------ limits
 
@@ -477,6 +516,172 @@ export async function runReviewPipeline(deps: PipelineDeps): Promise<PipelineRes
     failedPasses,
     ...(verdict ? { verdict } : {}),
   };
+}
+
+// ------------------------------------------------------------------ opencode
+
+async function prepareOpencodeReview(deps: OpenCodePipelineDeps): Promise<PreparedOpenCode | { status: "skipped"; reason: string }> {
+  const { job, settings, github, state, log } = deps;
+  const run = deps.run ?? { stage: () => undefined, log: () => undefined };
+
+  run.stage("load", `Loading PR #${job.prNumber}`, { depth: settings.depth, reviewers: settings.reviewers.join(", ") });
+  const pr = await github.getPullRequest();
+  if (pr.state !== "open") return { status: "skipped", reason: "pr-not-open" };
+  if (job.trigger === "auto" && pr.headSha !== job.headSha) return { status: "skipped", reason: "superseded" };
+
+  const lastReviewedSha = await state.getLastReviewedSha();
+  if (job.trigger === "auto" && job.mode === "incremental" && lastReviewedSha === pr.headSha) {
+    return { status: "skipped", reason: "already-reviewed" };
+  }
+
+  const allFiles = await github.listPullRequestFiles();
+  let mode = job.mode;
+  let scope: Set<string> | undefined;
+  if (mode === "incremental") {
+    if (lastReviewedSha && lastReviewedSha !== pr.headSha) {
+      const changed = await github.compareFiles(lastReviewedSha, pr.headSha).catch(() => undefined);
+      if (changed) scope = new Set(changed);
+      else mode = "full";
+    } else {
+      mode = "full";
+    }
+  }
+
+  const keepPath = createPathFilter(settings);
+  const candidates: ChangedFile[] = [];
+  let skipped = 0;
+  for (const file of allFiles) {
+    if (scope && !scope.has(file.filename)) continue;
+    const reviewable =
+      file.status !== "removed" && !!file.patch && file.patch.length <= MAX_PATCH_CHARS && keepPath(file.filename);
+    if (!reviewable) {
+      skipped++;
+      continue;
+    }
+    candidates.push(file);
+  }
+
+  if (candidates.length === 0) {
+    await state.saveState({ lastReviewedSha: pr.headSha });
+    return { status: "skipped", reason: scope ? "no-reviewable-changes-since-last-review" : "no-reviewable-files" };
+  }
+
+  const ranked = [...candidates].sort(
+    (a, b) => b.additions + b.deletions - (a.additions + a.deletions) || a.filename.localeCompare(b.filename),
+  );
+  const files = ranked.slice(0, MAX_FILES);
+  const truncated = ranked.length - files.length;
+  if (truncated > 0) {
+    skipped += truncated;
+    run.log("warn", `Review is limited to ${MAX_FILES} files; ${truncated} not inspected`, { selected: files.length });
+  }
+  run.log("info", `${files.length} files for opencode, ${skipped} skipped`, { mode, total: allFiles.length });
+
+  let guidelines: Guidelines | undefined;
+  if (settings.useRepoGuidelines) {
+    guidelines = await loadGuidelines(github, pr.baseSha).catch((err: Error) => {
+      run.log("warn", "Could not load repository guidelines", { error: err.message });
+      return undefined;
+    });
+    if (guidelines) run.log("info", `Loaded ${guidelines.files.length} guideline files`, { files: guidelines.files.join(", ") });
+  }
+
+  const summaryCommentId = await state.getSummaryCommentId();
+  return {
+    pr,
+    mode,
+    files,
+    filesSkipped: skipped,
+    scopeTruncated: truncated > 0,
+    lastReviewedSha,
+    summaryCommentId,
+    guidelines,
+  };
+}
+
+export async function runOpencodeReview(deps: OpenCodePipelineDeps): Promise<PipelineResult> {
+  const { settings, state, log } = deps;
+  const run = deps.run ?? { stage: () => undefined, log: () => undefined };
+  const prepared = await prepareOpencodeReview(deps);
+  if (!("pr" in prepared)) return prepared;
+
+  const workspace = deps.createWorkspace(prepared.pr.headSha);
+  try {
+    const checkout = await workspace.root();
+    await sanitizeCheckout(checkout);
+
+    const prompt = buildReviewPrompt({
+      settings,
+      pr: prepared.pr,
+      files: prepared.files,
+      mode: prepared.mode,
+      lastReviewedSha: prepared.lastReviewedSha,
+      guidelines: prepared.guidelines,
+      instructions: deps.job.instructions,
+      filesSkipped: prepared.filesSkipped,
+    });
+
+    run.stage("review", `Running the opencode reviewer over ${prepared.files.length} files`, {
+      mode: prepared.mode,
+      depth: settings.depth,
+      files: prepared.files.length,
+    });
+
+    const output = await runOpenCodeAgent({
+      job: deps.job,
+      settings,
+      headSha: prepared.pr.headSha,
+      baseSha: prepared.pr.baseSha,
+      mode: prepared.mode,
+      platformDefault: deps.platformDefault,
+      checkout,
+      githubToken: await deps.getGithubToken(),
+      apiKey: deps.opencodeApiKey,
+      files: prepared.files.map((file) => file.filename),
+      filesSkipped: prepared.filesSkipped,
+      scopeTruncated: prepared.scopeTruncated,
+      mention: deps.mention,
+      botLogin: deps.botLogin,
+      summaryCommentId: prepared.summaryCommentId,
+      guidelineFiles: prepared.guidelines?.files ?? [],
+      prompt,
+      budgetMs: deps.reviewBudgetMs,
+      signal: deps.signal,
+      log: (message, extra) => {
+        log(message, extra);
+        run.log("info", message, extra);
+      },
+    });
+
+    const summaryCommentId = output.result.summaryCommentId ?? prepared.summaryCommentId;
+    if (output.result.complete) {
+      await state.saveState({
+        lastReviewedSha: prepared.pr.headSha,
+        ...(summaryCommentId !== undefined ? { summaryCommentId } : {}),
+      });
+    } else if (summaryCommentId !== undefined) {
+      await state.saveState({ summaryCommentId });
+    }
+
+    run.log("info", `Review published by ${output.model}`, {
+      verdict: output.result.verdict,
+      comments: output.result.commentsPosted,
+      complete: output.result.complete,
+      costUsd: output.cost,
+    });
+
+    return {
+      status: "completed",
+      filesReviewed: output.result.reviewedFiles.length,
+      findingsRaw: output.result.findingsRaw,
+      commentsPosted: output.result.commentsPosted,
+      failedPasses: output.result.complete ? 0 : 1,
+      ...(output.result.verdict ? { verdict: output.result.verdict } : {}),
+      usage: { ...output.tokens, costUsd: output.cost, model: output.model },
+    };
+  } finally {
+    await workspace.dispose();
+  }
 }
 
 // ------------------------------------------------------------------ stages

@@ -39,12 +39,25 @@ export async function GET(request: Request) {
   const tokenJson = (await tokenRes?.json().catch(() => null)) as { access_token?: string } | null;
   if (!tokenJson?.access_token) return fail("login_token");
 
-  const { data: user } = await new Octokit({ auth: tokenJson.access_token }).rest.users.getAuthenticated();
+  const octokit = new Octokit({ auth: tokenJson.access_token });
+  const { data: user } = await octokit.rest.users.getAuthenticated();
+  let email = user.email ?? undefined;
+  if (!email) {
+    try {
+      const { data: emails } = await octokit.rest.users.listEmailsForAuthenticatedUser();
+      const primary = emails.find((e) => e.primary)?.email ?? emails[0]?.email;
+      if (primary) email = primary;
+    } catch {
+      // Ignored if user:email scope was not granted
+    }
+  }
+
   await createSession({
     userId: user.id,
     login: user.login,
     avatarUrl: user.avatar_url,
     token: tokenJson.access_token,
+    ...(email ? { email } : {}),
   });
   return Response.redirect(`${env.appUrl()}/dashboard`, 302);
 }

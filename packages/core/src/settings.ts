@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { FREE_MODEL_IDS } from "./models";
 
 export const REVIEWER_KINDS = ["security", "bugs", "performance", "style", "tests"] as const;
 export type ReviewerKind = (typeof REVIEWER_KINDS)[number];
@@ -49,14 +50,14 @@ export const DEPTH_PROFILES: Record<
     useJudge: true,
     principalSteps: 3,
     label: "Standard",
-    description: "Reviewers can open a few related files. A judge pass removes noise.",
+    description: "The agent can open related files and verify a few callers.",
   },
   deep: {
     toolSteps: 10,
     useJudge: true,
     principalSteps: 8,
     label: "Deep",
-    description: "Reviewers explore the codebase (callers, types, configs) before commenting.",
+    description: "The agent explores the codebase (callers, types, configs) before commenting.",
   },
 };
 
@@ -115,6 +116,9 @@ export const RepoSettingsSchema = z.object({
   /** Read review rules committed on the base branch (.ownrabbit/review.md, AGENTS.md, .kiro/steering, ...). */
   useRepoGuidelines: z.boolean().default(true),
   tone: z.enum(TONES).default("concise"),
+  /** Free OpenCode model for the opencode engine. Undefined means the platform default. */
+  reviewModel: z.enum(FREE_MODEL_IDS).optional(),
+  /** Legacy custom-engine settings. Ignored by the opencode engine. */
   model: modelId.default(DEFAULT_MODEL),
   triageModel: modelId.default(DEFAULT_TRIAGE_MODEL),
 });

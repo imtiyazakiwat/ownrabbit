@@ -163,7 +163,7 @@ export function RepoList({ repos }: { repos: RepoRow[] }) {
                 status === key ? "bg-paper text-ink" : "text-muted hover:text-paper"
               }`}
             >
-              {key === "all" ? "All" : key === "on" ? "Enabled" : "Paused"}
+              {key === "all" ? "All" : key === "on" ? "Enabled" : "Disabled"}
               <span className={`ml-1.5 ${status === key ? "text-ink/60" : "text-dim"}`}>{counts[key]}</span>
             </button>
           ))}
@@ -281,7 +281,7 @@ function RepoItem({ repo, highlighted }: { repo: RepoRow; highlighted: boolean }
           }`}
         >
           <span aria-hidden className={`h-1.5 w-1.5 rounded-full ${repo.enabled ? "bg-add" : "bg-dim"}`} />
-          {repo.enabled ? "Enabled" : "Paused"}
+          {repo.enabled ? "Enabled" : "Disabled"}
         </span>
         <span className="border border-line px-2 py-0.5 text-muted">{TRIGGER_SHORT[repo.trigger]}</span>
         <span className="border border-line px-2 py-0.5 text-muted capitalize">

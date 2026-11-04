@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod";
-import { createLlmClient, extractJson, LlmError } from "./llm";
+import { createLlmClient, DEFAULT_MAX_TOKENS, extractJson, LlmError } from "./llm";
 
 const reply = (content: string | null, extra: Record<string, unknown> = {}) =>
   new Response(JSON.stringify({ choices: [{ message: { content } }], usage: { total_tokens: 7 }, ...extra }), {
@@ -29,6 +29,15 @@ describe("createLlmClient", () => {
     await expect(llm.chatJson({ model: "m", messages: [] }, schema)).resolves.toEqual({ ok: true });
     expect(llm.tokensUsed).toBe(7);
     expect(fetchImpl.mock.calls[0]![0]).toBe("https://x/v1/chat/completions");
+  });
+
+  it("sends a large default output budget and honours overrides", async () => {
+    const fetchImpl = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => reply('{"ok":true}'));
+    const llm = createLlmClient({ baseUrl: "https://x/v1", apiKey: "k", fetchImpl: fetchImpl as typeof fetch });
+    await llm.chat({ model: "m", messages: [] });
+    await llm.chat({ model: "m", messages: [], maxTokens: 500 });
+    const sent = fetchImpl.mock.calls.map((c) => JSON.parse(String(c[1]!.body)).max_tokens);
+    expect(sent).toEqual([DEFAULT_MAX_TOKENS, 500]);
   });
 
   it("falls back to the non-standard `answer` field", async () => {

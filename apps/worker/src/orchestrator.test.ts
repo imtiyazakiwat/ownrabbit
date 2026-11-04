@@ -160,6 +160,7 @@ function deps(o: {
     llm: o.llm ?? fakeLlm(),
     mention: "@ownrabbit",
     createWorkspace: () => ({
+      root: async () => "/tmp/repo",
       readFile: async () => "",
       search: async () => "No matches",
       listDir: async () => "",
