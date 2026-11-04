@@ -8,11 +8,22 @@ const LINKS = [
   { href: "/dashboard/runs", label: "Runs", match: (p: string) => p.startsWith("/dashboard/runs") },
 ];
 
-export function DashboardNav() {
+export function DashboardNav({ isAdmin = false }: { isAdmin?: boolean }) {
   const pathname = usePathname();
+  const allLinks = isAdmin
+    ? [
+        ...LINKS,
+        {
+          href: "/dashboard/admin",
+          label: "Admin",
+          match: (p: string) => p.startsWith("/dashboard/admin") || p.startsWith("/dashboard/service"),
+        },
+      ]
+    : LINKS;
+
   return (
     <nav aria-label="Dashboard" className="flex gap-5 text-sm">
-      {LINKS.map((link) => {
+      {allLinks.map((link) => {
         const active = link.match(pathname);
         return (
           <Link

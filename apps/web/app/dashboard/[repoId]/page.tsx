@@ -1,5 +1,5 @@
-import { resolveSettings } from "@ownrabbit/core";
-import { collections, db, type ReviewDoc } from "@ownrabbit/core/server";
+import { DEFAULT_FREE_MODEL, resolveSettings } from "@ownrabbit/core";
+import { collections, db, getReviewModelConfig, type ReviewDoc } from "@ownrabbit/core/server";
 import type { Metadata } from "next";
 import Link from "next/link";
 import { notFound } from "next/navigation";
@@ -41,7 +41,11 @@ export default async function RepoPage({ params }: { params: Promise<{ repoId: s
   const repo = await findAccessibleRepo(session, Number(raw)).catch(() => undefined);
   if (!repo) notFound();
 
-  const [docs, reviews] = await Promise.all([loadRepoDocs([repo.repoId]), recentReviews(repo.repoId).catch(() => null)]);
+  const [docs, reviews, modelConfig] = await Promise.all([
+    loadRepoDocs([repo.repoId]),
+    recentReviews(repo.repoId).catch(() => null),
+    getReviewModelConfig().catch(() => ({ defaultModel: DEFAULT_FREE_MODEL })),
+  ]);
   const settings = resolveSettings(docs.get(repo.repoId)?.settings);
   const mention = `@${process.env.GITHUB_APP_SLUG ?? "ownrabbit"}`;
 
@@ -100,7 +104,13 @@ export default async function RepoPage({ params }: { params: Promise<{ repoId: s
       )}
 
       <div className="mt-10">
-        <SettingsForm repoId={repo.repoId} initial={settings} canEdit={repo.canEdit} mention={mention} />
+        <SettingsForm
+          repoId={repo.repoId}
+          initial={settings}
+          canEdit={repo.canEdit}
+          mention={mention}
+          platformDefault={modelConfig.defaultModel}
+        />
       </div>
 
       <section aria-labelledby="history" className="mt-20">

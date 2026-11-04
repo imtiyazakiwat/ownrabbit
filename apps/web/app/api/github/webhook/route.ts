@@ -4,9 +4,12 @@ import {
   collections,
   db,
   FieldValue,
+  getPauseState,
   getRepoSettings,
   installationOctokit,
   mentionHandle,
+  postPausedComment,
+  type PauseState,
 } from "@ownrabbit/core/server";
 import { env } from "@/lib/env";
 import { enqueueReview } from "@/lib/queue";
@@ -156,6 +159,69 @@ async function enqueue(
   return ok({ result, mode: decision.mode });
 }
 
+/**
+ * Service is paused: post the pause note on the PR and record the run as
+ * "paused" instead of enqueueing a Cloud Tasks job (so nothing is retried).
+ */
+async function respondPaused(
+  delivery: string,
+  decision: Extract<Decision, { review: true }>,
+  payload: Json,
+  pause: PauseState,
+  prNumber: number,
+  headSha: string,
+  trigger: ReviewJob["trigger"],
+  extra: Partial<ReviewJob> = {},
+) {
+  const job: ReviewJob = {
+    jobId: delivery.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 100),
+    installationId: payload.installation.id,
+    repoId: payload.repository.id,
+    owner: payload.repository.owner.login,
+    repo: payload.repository.name,
+    prNumber,
+    headSha,
+    mode: decision.mode,
+    trigger,
+    instructions: decision.instructions,
+    ...extra,
+  };
+  const octokit = await installationOctokit(payload.installation.id).catch(() => undefined);
+  const posted = octokit
+    ? await postPausedComment({
+        octokit,
+        owner: payload.repository.owner.login,
+        repo: payload.repository.name,
+        repoId: payload.repository.id,
+        prNumber,
+        mention: mentionHandle(),
+        message: pause.message,
+      })
+    : "failed";
+  await db()
+    .collection(collections.reviews)
+    .doc(job.jobId)
+    .set(
+      {
+        jobId: job.jobId,
+        repoId: job.repoId,
+        fullName: payload.repository.full_name,
+        prNumber,
+        headSha,
+        mode: job.mode,
+        trigger,
+        requestedBy: job.requestedBy,
+        status: "paused",
+        reason: "service is paused",
+        posted,
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+  return ok({ paused: true, posted });
+}
+
 async function handlePullRequest(delivery: string, payload: Json) {
   const pr = payload.pull_request;
   if (!pr || !payload.installation?.id || !payload.repository?.id) return ok({ ignored: "incomplete" });
@@ -165,6 +231,13 @@ async function handlePullRequest(delivery: string, payload: Json) {
 
   const decision = decideForPullRequest(payload.action, pr, settings);
   if (!decision.review) return ok({ skipped: decision.reason });
+
+  // Service-wide pause takes precedence over repo settings.
+  const pause = await getPauseState().catch((err) => {
+    console.error("pause state lookup failed; proceeding", err);
+    return undefined;
+  });
+  if (pause?.paused) return respondPaused(delivery, decision, payload, pause, pr.number, pr.head.sha, "auto");
   return enqueue(delivery, decision, payload, pr.number, pr.head.sha, "auto");
 }
 
@@ -186,6 +259,18 @@ async function handleComment(delivery: string, payload: Json) {
     settings,
   });
   if (!decision.review) return ok({ skipped: decision.reason });
+
+  // Service-wide pause takes precedence; the mention is answered inline.
+  const pause = await getPauseState().catch((err) => {
+    console.error("pause state lookup failed; proceeding", err);
+    return undefined;
+  });
+  if (pause?.paused) {
+    return respondPaused(delivery, decision, payload, pause, issue.number, "", "mention", {
+      commentId: comment.id,
+      requestedBy: comment.user?.login,
+    });
+  }
 
   // issue_comment payloads don't include the PR head; fetch it.
   const octokit = await installationOctokit(payload.installation.id);

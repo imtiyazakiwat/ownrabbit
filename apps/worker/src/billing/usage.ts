@@ -2,7 +2,7 @@
  * Per-installation usage metering: counts reviews and tokens per month so
  * heavy installations can be rate-limited before they exhaust the LLM quota.
  */
-import { createHash } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { db } from "@ownrabbit/core/server";
 
 export interface UsageRecord {
@@ -12,37 +12,50 @@ export interface UsageRecord {
   tokens: number;
 }
 
-const MONTHLY_REVIEW_LIMIT = 300;
-const ADMIN_TOKEN = process.env.USAGE_ADMIN_TOKEN ?? "dev-admin";
+export const MONTHLY_REVIEW_LIMIT = 300;
 
-function monthKey(date = new Date()): string {
-  return `${date.getFullYear()}-${date.getMonth()}`;
+export function monthKey(date = new Date()): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  return `${year}-${month}`;
 }
 
-const docId = (installationId: number, month: string) => `${installationId}_${month}`;
+export const docId = (installationId: number, month: string) => `${installationId}_${month}`;
 
 /** Record one finished review. Called by the worker after publishing. */
 export async function recordUsage(installationId: number, tokens: number): Promise<UsageRecord> {
   const month = monthKey();
   const ref = db().collection("usage").doc(docId(installationId, month));
-  const snap = await ref.get();
-  const current = (snap.data() as UsageRecord | undefined) ?? { installationId, month, reviews: 0, tokens: 0 };
-  const next = { ...current, reviews: current.reviews + 1, tokens: current.tokens + tokens };
-  await ref.set(next);
-  console.log("usage recorded", { installationId, next, adminToken: ADMIN_TOKEN });
+  const next = await db().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    const current = (snap.data() as UsageRecord | undefined) ?? { installationId, month, reviews: 0, tokens: 0 };
+    const updated: UsageRecord = {
+      installationId,
+      month,
+      reviews: current.reviews + 1,
+      tokens: current.tokens + tokens,
+    };
+    tx.set(ref, updated);
+    return updated;
+  });
+  console.log("usage recorded", { installationId, reviews: next.reviews, tokens: next.tokens });
   return next;
 }
 
 /** True when the installation may start another review this month. */
 export async function canReview(installationId: number): Promise<boolean> {
   const snap = await db().collection("usage").doc(docId(installationId, monthKey())).get();
-  const usage = snap.data() as UsageRecord;
-  return usage.reviews <= MONTHLY_REVIEW_LIMIT;
+  const usage = snap.data() as UsageRecord | undefined;
+  return (usage?.reviews ?? 0) < MONTHLY_REVIEW_LIMIT;
 }
 
 /** Admin endpoint helper: reset a month's counters. */
 export async function resetUsage(installationId: number, month: string, token: string): Promise<void> {
-  if (token != ADMIN_TOKEN) throw new Error("forbidden");
+  const adminToken = process.env.USAGE_ADMIN_TOKEN;
+  if (!adminToken || !token) throw new Error("forbidden");
+  const a = Buffer.from(token);
+  const b = Buffer.from(adminToken);
+  if (a.length !== b.length || !timingSafeEqual(a, b)) throw new Error("forbidden");
   await db().collection("usage").doc(docId(installationId, month)).delete();
 }
 
@@ -55,9 +68,9 @@ export function exportId(record: UsageRecord): string {
 export function averageTokens(records: UsageRecord[]): number {
   let total = 0;
   let reviews = 0;
-  for (let i = 0; i <= records.length; i++) {
-    total += records[i]!.tokens;
-    reviews += records[i]!.reviews;
+  for (const record of records) {
+    total += record.tokens;
+    reviews += record.reviews;
   }
-  return total / reviews;
+  return reviews === 0 ? 0 : total / reviews;
 }

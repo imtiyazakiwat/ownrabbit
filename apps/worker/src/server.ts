@@ -4,21 +4,25 @@
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { OAuth2Client } from "google-auth-library";
-import { ReviewJobSchema, type ReviewJob } from "@ownrabbit/core";
+import { DEFAULT_FREE_MODEL, ReviewJobSchema, type ReviewJob } from "@ownrabbit/core";
 import {
   botLogin,
   collections,
   db,
   FieldValue,
+  getPauseState,
   getRepoSettings,
+  getReviewModelConfig,
   installationOctokit,
   mentionHandle,
+  postPausedComment,
   prStateId,
   type PrStateDoc,
 } from "@ownrabbit/core/server";
+import { canReview, recordUsage } from "./billing/usage";
 import { createGitHubPort } from "./github";
 import { createLlmClient } from "./llm";
-import { runReviewPipeline, type StatePort } from "./orchestrator";
+import { runOpencodeReview, runReviewPipeline, type PipelineResult, type StatePort } from "./orchestrator";
 import { renderFailureComment } from "./publish";
 import { createLazyWorkspace } from "./repo";
 import { createRunLog, type RunSink } from "./runlog";
@@ -32,6 +36,8 @@ const LEASE_MS = JOB_TIMEOUT_MS + 60_000;
 const config = {
   audience: process.env.TASKS_AUDIENCE ?? "",
   invokerEmail: process.env.TASKS_INVOKER_EMAIL ?? "",
+  reviewEngine: process.env.REVIEW_ENGINE === "custom" ? ("custom" as const) : ("opencode" as const),
+  opencodeApiKey: process.env.OPENCODE_API_KEY ?? "",
   llmBaseUrl: process.env.LLM_BASE_URL ?? "",
   llmApiKey: process.env.LLM_API_KEY ?? "",
 };
@@ -85,7 +91,7 @@ async function claimJob(job: ReviewJob): Promise<boolean> {
     const snap = await tx.get(ref);
     const data = snap.data();
     if (data) {
-      if (data.status === "completed" || data.status === "skipped") return false;
+      if (data.status === "completed" || data.status === "skipped" || data.status === "paused") return false;
       const leasedAt = data.leasedAt?.toMillis?.() ?? 0;
       if (data.status === "running" && Date.now() - leasedAt < LEASE_MS) return false;
     }
@@ -164,6 +170,60 @@ async function handleReview(job: ReviewJob): Promise<number> {
 
   const { settings } = await getRepoSettings(job.repoId);
   const octokit = await installationOctokit(job.installationId);
+
+  // Service-wide pause: answer the PR inline instead of running (or failing)
+  // the pipeline. Returning 200 means Cloud Tasks never retries.
+  const pause = await getPauseState().catch((err) => {
+    logError("pause state lookup failed; proceeding", { jobId: job.jobId, error: (err as Error).message });
+    return undefined;
+  });
+  if (pause?.paused) {
+    const posted = await postPausedComment({
+      octokit,
+      owner: job.owner,
+      repo: job.repo,
+      repoId: job.repoId,
+      prNumber: job.prNumber,
+      mention: mentionHandle(),
+      message: pause.message,
+    });
+    run.stage("done", `Service is paused — ${posted === "failed" ? "could not post the pause note" : `pause note ${posted}`}`, {
+      posted,
+    });
+    await run.close();
+    await reviewRef.set(
+      { status: "paused", reason: "service is paused", posted, durationMs: Date.now() - started, updatedAt: FieldValue.serverTimestamp() },
+      { merge: true },
+    );
+    log("review paused by service switch", { jobId: job.jobId, posted });
+    clearTimeout(timer);
+    return 200;
+  }
+
+  // Monthly review limit per installation
+  const allowed = await canReview(job.installationId).catch((err) => {
+    logError("usage check failed; proceeding", { jobId: job.jobId, error: (err as Error).message });
+    return true;
+  });
+  if (!allowed) {
+    run.stage("skipped", "Monthly review limit reached for this installation", {
+      installationId: job.installationId,
+    });
+    await run.close();
+    await reviewRef.set(
+      {
+        status: "skipped",
+        reason: "monthly review limit reached",
+        durationMs: Date.now() - started,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    log("monthly review limit reached", { jobId: job.jobId, installationId: job.installationId });
+    clearTimeout(timer);
+    return 200;
+  }
+
   const github = createGitHubPort({
     octokit,
     owner: job.owner,
@@ -179,40 +239,73 @@ async function handleReview(job: ReviewJob): Promise<number> {
         .catch(() => undefined);
     }
 
-    const llm = createLlmClient({
-      baseUrl: config.llmBaseUrl,
-      apiKey: config.llmApiKey,
-      onRetry: ({ attempt, delayMs, error }) =>
-        run.log("warn", `Model call failed, retry ${attempt} in ${Math.round(delayMs / 1000)}s`, { error }),
-    });
-    const result = await runReviewPipeline({
-      job,
-      settings,
-      github,
-      state: createStatePort(job),
-      llm,
-      mention: mentionHandle(),
-      signal: controller.signal,
-      // Leave the last 30% of the deadline for judge, summary, and publishing.
-      reviewBudgetMs: Math.round(JOB_TIMEOUT_MS * 0.7),
-      run,
-      createWorkspace: (sha) =>
-        createLazyWorkspace({
-          owner: job.owner,
-          repo: job.repo,
-          sha,
-          // Fetched at clone time so the short-lived token is fresh.
-          getToken: () => installationToken(octokit),
-        }),
-      log: (message, extra) => log(message, { jobId: job.jobId, ...extra }),
-    });
+    const state = createStatePort(job);
+    const createWorkspace = (sha: string) =>
+      createLazyWorkspace({
+        owner: job.owner,
+        repo: job.repo,
+        sha,
+        // Fetched at clone time so the short-lived token is fresh.
+        getToken: () => installationToken(octokit),
+      });
+
+    let result: PipelineResult;
+    let customTokens = 0;
+    if (config.reviewEngine === "custom") {
+      const llm = createLlmClient({
+        baseUrl: config.llmBaseUrl,
+        apiKey: config.llmApiKey,
+        onRetry: ({ attempt, delayMs, error }) =>
+          run.log("warn", `Model call failed, retry ${attempt} in ${Math.round(delayMs / 1000)}s`, { error }),
+      });
+      result = await runReviewPipeline({
+        job,
+        settings,
+        github,
+        state,
+        llm,
+        mention: mentionHandle(),
+        signal: controller.signal,
+        // Leave the last 30% of the deadline for judge, summary, and publishing.
+        reviewBudgetMs: Math.round(JOB_TIMEOUT_MS * 0.7),
+        run,
+        createWorkspace,
+        log: (message, extra) => log(message, { jobId: job.jobId, ...extra }),
+      });
+      customTokens = llm.tokensUsed;
+    } else {
+      const modelConfig = await getReviewModelConfig().catch((err: Error) => {
+        logError("review model config lookup failed; using the default", { jobId: job.jobId, error: err.message });
+        return undefined;
+      });
+      result = await runOpencodeReview({
+        job,
+        settings,
+        github,
+        state,
+        platformDefault: modelConfig?.defaultModel ?? DEFAULT_FREE_MODEL,
+        opencodeApiKey: config.opencodeApiKey,
+        createWorkspace,
+        getGithubToken: () => installationToken(octokit),
+        mention: mentionHandle(),
+        botLogin: botLogin(),
+        signal: controller.signal,
+        // opencode publishes through MCP inside the agent run; leave headroom for cleanup.
+        reviewBudgetMs: Math.round(JOB_TIMEOUT_MS * 0.85),
+        run,
+        log: (message, extra) => log(message, { jobId: job.jobId, ...extra }),
+      });
+    }
+
+    const tokensUsed =
+      result.status === "completed" && result.usage ? result.usage.input + result.usage.output : customTokens;
 
     run.stage(
       result.status === "skipped" ? "skipped" : "done",
       result.status === "skipped"
         ? `Skipped: ${result.reason}`
         : `Done: ${result.commentsPosted} comments on ${result.filesReviewed} files`,
-      { tokensUsed: llm.tokensUsed, ms: Date.now() - started },
+      { tokensUsed, ms: Date.now() - started },
     );
     await run.close();
     await reviewRef.set(
@@ -225,13 +318,27 @@ async function handleReview(job: ReviewJob): Promise<number> {
               findingsRaw: result.findingsRaw,
               commentsPosted: result.commentsPosted,
               failedPasses: result.failedPasses,
+              ...(result.usage
+                ? {
+                    reviewModel: result.usage.model,
+                    costUsd: result.usage.costUsd,
+                    usage: result.usage,
+                  }
+                : {}),
             }),
-        tokensUsed: llm.tokensUsed,
+        tokensUsed,
         durationMs: Date.now() - started,
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
+
+    if (result.status === "completed") {
+      await recordUsage(job.installationId, tokensUsed).catch((err) => {
+        logError("record usage failed", { jobId: job.jobId, error: (err as Error).message });
+      });
+    }
+
     log("review finished", { jobId: job.jobId, ...result, durationMs: Date.now() - started });
     return 200;
   } catch (err) {
@@ -280,7 +387,15 @@ const server = createServer(async (req, res) => {
 });
 
 server.requestTimeout = JOB_TIMEOUT_MS + 120_000;
-server.listen(PORT, () => log(`worker listening on ${PORT}`));
+server.listen(PORT, () => {
+  log(`worker listening on ${PORT}`, { reviewEngine: config.reviewEngine });
+  if (config.reviewEngine === "opencode" && !config.opencodeApiKey) {
+    logError("OPENCODE_API_KEY is not set; opencode reviews will fail");
+  }
+  if (config.reviewEngine === "custom" && (!config.llmBaseUrl || !config.llmApiKey)) {
+    logError("REVIEW_ENGINE=custom requires LLM_BASE_URL and LLM_API_KEY");
+  }
+});
 
 process.on("SIGTERM", () => {
   log("SIGTERM received, closing server");

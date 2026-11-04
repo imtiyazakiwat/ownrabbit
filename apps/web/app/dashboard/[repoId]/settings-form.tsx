@@ -5,12 +5,16 @@ import {
   DEFAULT_EXCLUDES,
   DEPTH_PROFILES,
   DEPTHS,
+  FREE_MODELS,
+  freeModel,
   matchPreset,
   PRESETS,
+  RECOMMENDED_FREE_MODELS,
   REVIEWER_INFO,
   REVIEWER_KINDS,
   SEVERITIES,
   TONES,
+  type FreeModelId,
   type RepoSettings,
   type ReviewerKind,
 } from "@ownrabbit/core";
@@ -49,7 +53,7 @@ const SECTIONS = [
   ["noise", "Noise"],
   ["scope", "Scope"],
   ["rules", "House rules"],
-  ["models", "Models"],
+  ["models", "Model"],
 ] as const;
 
 const lines = (text: string) =>
@@ -65,11 +69,13 @@ export function SettingsForm({
   initial,
   canEdit,
   mention,
+  platformDefault,
 }: {
   repoId: number;
   initial: RepoSettings;
   canEdit: boolean;
   mention: string;
+  platformDefault: FreeModelId;
 }) {
   const [saved, setSaved] = useState(initial);
   const [s, setS] = useState(initial);
@@ -177,8 +183,12 @@ export function SettingsForm({
             <Toggle
               checked={s.enabled}
               onChange={(v) => set("enabled", v)}
-              label={s.enabled ? "Reviews are on" : "Reviews are paused"}
-              hint={s.enabled ? "OwnRabbit will review pull requests in this repository." : "Nothing will be reviewed until you turn this back on."}
+              label={s.enabled ? "Repository enabled" : "Repository disabled"}
+              hint={
+                s.enabled
+                  ? "OwnRabbit is active for this repository (reviews can be paused globally in Admin)."
+                  : "Reviews are disabled for this repository."
+              }
             />
           </Section>
 
@@ -232,9 +242,7 @@ export function SettingsForm({
                 label: DEPTH_PROFILES[d].label,
                 hint: DEPTH_PROFILES[d].description,
                 adornment: <DepthMeter level={DEPTH_GLYPH[d]} />,
-                meta: DEPTH_PROFILES[d].toolSteps
-                  ? `up to ${DEPTH_PROFILES[d].toolSteps} lookups / reviewer`
-                  : "diff only",
+                meta: d === "quick" ? "4 agent steps" : d === "standard" ? "10 agent steps" : "20 agent steps",
               }))}
             />
             <div className="mt-5 grid gap-3 sm:grid-cols-2">
@@ -242,7 +250,7 @@ export function SettingsForm({
                 small
                 checked={s.principalReview}
                 onChange={(v) => set("principalReview", v)}
-                label="Principal pass: verdict, risk table, verification log"
+                label="Include verdict, risks, and verification summary"
               />
               <Toggle
                 small
@@ -258,11 +266,11 @@ export function SettingsForm({
               />
             </div>
             {s.depth === "quick" && s.principalReview && (
-              <p className="mt-2 text-[11px] text-dim">The principal pass runs at Standard and Deep only.</p>
+              <p className="mt-2 text-[11px] text-dim">Quick reviews keep the verdict and risk summary short.</p>
             )}
           </Section>
 
-          <Section id="reviewers" n={5} title="Sub-reviewers" hint="Each specialist runs in parallel with its own brief, then a judge merges their findings.">
+          <Section id="reviewers" n={5} title="Review focus" hint="The review agent covers every selected area in one pass, then a strict publisher validates its findings.">
             <div className="grid gap-2 sm:grid-cols-2">
               {REVIEWER_KINDS.map((kind, i) => {
                 const on = s.reviewers.includes(kind);
@@ -285,7 +293,7 @@ export function SettingsForm({
                     <span className="min-w-0">
                       <span className="flex items-baseline gap-2">
                         <span className="font-display text-base">{REVIEWER_INFO[kind].label}</span>
-                        <span className="text-[10px] text-dim">agent {String(i + 1).padStart(2, "0")}</span>
+                        <span className="text-[10px] text-dim">focus {String(i + 1).padStart(2, "0")}</span>
                       </span>
                       <span className="mt-0.5 block text-xs leading-snug text-muted">{REVIEWER_INFO[kind].description}</span>
                     </span>
@@ -431,21 +439,39 @@ export function SettingsForm({
             </div>
           </Section>
 
-          <Section id="models" n={9} title="Models" hint="Any model id your configured endpoint serves.">
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="Review model" sub="specialists, judge, summary" htmlFor="model">
-                <input id="model" value={s.model} onChange={(e) => set("model", e.target.value)} spellCheck={false} className="input font-mono text-xs" />
-              </Field>
-              <Field label="Triage model" sub="fast pre-pass" htmlFor="triageModel">
-                <input
-                  id="triageModel"
-                  value={s.triageModel}
-                  onChange={(e) => set("triageModel", e.target.value)}
-                  spellCheck={false}
-                  className="input font-mono text-xs"
-                />
-              </Field>
-            </div>
+          <Section id="models" n={9} title="Review model" hint="Free OpenCode models only. The operator sets the platform default.">
+            <Field
+              label="Model"
+              sub={`Platform default: ${freeModel(platformDefault).name}`}
+              htmlFor="reviewModel"
+            >
+              <select
+                id="reviewModel"
+                value={s.reviewModel ?? ""}
+                onChange={(e) => set("reviewModel", e.target.value ? (e.target.value as FreeModelId) : undefined)}
+                className="input font-mono text-xs"
+              >
+                <option value="">Platform default — {freeModel(platformDefault).name}</option>
+                <optgroup label="Recommended">
+                  {RECOMMENDED_FREE_MODELS.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name} · {Math.round(m.context / 1000)}k ctx
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="All free models">
+                  {FREE_MODELS.filter((m) => !RECOMMENDED_FREE_MODELS.some((r) => r.id === m.id)).map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.name} · {Math.round(m.context / 1000)}k ctx
+                    </option>
+                  ))}
+                </optgroup>
+              </select>
+            </Field>
+            <p className="mt-2 text-[11px] leading-relaxed text-dim">
+              Only zero-cost models are available. If the selected model is rate-limited, the worker falls back to the
+              platform default and then to another free model.
+            </p>
           </Section>
         </fieldset>
 
@@ -486,7 +512,7 @@ export function SettingsForm({
       {/* ---- live preview */}
       <aside aria-label="Preview" className="hidden xl:block">
         <div className="sticky top-6 space-y-4">
-          <ReviewPreview settings={draft} mention={mention} />
+          <ReviewPreview settings={draft} mention={mention} platformDefault={platformDefault} />
         </div>
       </aside>
     </div>
@@ -495,13 +521,27 @@ export function SettingsForm({
 
 // ------------------------------------------------------------------ preview
 
-function ReviewPreview({ settings, mention }: { settings: RepoSettings; mention: string }) {
-  const profile = DEPTH_PROFILES[settings.depth];
+function ReviewPreview({
+  settings,
+  mention,
+  platformDefault,
+}: {
+  settings: RepoSettings;
+  mention: string;
+  platformDefault: FreeModelId;
+}) {
+  const model = freeModel(settings.reviewModel ?? platformDefault);
+  const steps = settings.depth === "quick" ? 4 : settings.depth === "standard" ? 10 : 20;
   const stages = [
-    { name: "Triage", detail: settings.triageModel, on: true },
-    ...settings.reviewers.map((r) => ({ name: REVIEWER_INFO[r].label, detail: profile.toolSteps ? `${profile.toolSteps} lookups` : "diff only", on: true, indent: true })),
-    { name: "Judge", detail: profile.useJudge ? "filters noise" : "skipped on quick", on: profile.useJudge },
-    { name: "Post", detail: `≤ ${settings.maxComments} comments`, on: true },
+    { name: "Agent", detail: model.name, on: true },
+    ...settings.reviewers.map((r) => ({
+      name: REVIEWER_INFO[r].label,
+      detail: settings.depth === "quick" ? "diff only" : `${steps} steps`,
+      on: true,
+      indent: true,
+    })),
+    { name: "Validate", detail: `≤ ${settings.maxComments} comments`, on: true },
+    { name: "Post", detail: "inline + summary", on: true },
   ];
 
   return (
@@ -528,7 +568,7 @@ function ReviewPreview({ settings, mention }: { settings: RepoSettings; mention:
               : settings.trigger === "auto"
                 ? "Runs on every PR open and push."
                 : `Runs on every push, or on ${mention}.`
-            : "Paused: nothing will run."}
+            : "Disabled: reviews turned off for this repository."}
         </p>
       </div>
 

@@ -12,6 +12,7 @@ export interface Session {
   login: string;
   avatarUrl: string;
   token: string;
+  email?: string;
 }
 
 const COOKIE = "or_session";
@@ -44,9 +45,15 @@ export async function getSession(): Promise<Session | null> {
   if (!raw) return null;
   try {
     const { payload } = await jwtDecrypt(raw, await key());
-    const { userId, login, avatarUrl, token } = payload as unknown as Session;
+    const { userId, login, avatarUrl, token, email } = payload as unknown as Session;
     if (typeof userId !== "number" || typeof token !== "string" || typeof login !== "string") return null;
-    return { userId, login, avatarUrl, token };
+    return {
+      userId,
+      login,
+      avatarUrl,
+      token,
+      ...(typeof email === "string" ? { email } : {}),
+    };
   } catch {
     return null;
   }
