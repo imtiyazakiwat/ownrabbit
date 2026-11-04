@@ -19,6 +19,7 @@ import {
   prStateId,
   type PrStateDoc,
 } from "@ownrabbit/core/server";
+import { canReview, recordUsage } from "./billing/usage";
 import { createGitHubPort } from "./github";
 import { createLlmClient } from "./llm";
 import { runOpencodeReview, runReviewPipeline, type PipelineResult, type StatePort } from "./orchestrator";
@@ -199,6 +200,30 @@ async function handleReview(job: ReviewJob): Promise<number> {
     return 200;
   }
 
+  // Monthly review limit per installation
+  const allowed = await canReview(job.installationId).catch((err) => {
+    logError("usage check failed; proceeding", { jobId: job.jobId, error: (err as Error).message });
+    return true;
+  });
+  if (!allowed) {
+    run.stage("skipped", "Monthly review limit reached for this installation", {
+      installationId: job.installationId,
+    });
+    await run.close();
+    await reviewRef.set(
+      {
+        status: "skipped",
+        reason: "monthly review limit reached",
+        durationMs: Date.now() - started,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    log("monthly review limit reached", { jobId: job.jobId, installationId: job.installationId });
+    clearTimeout(timer);
+    return 200;
+  }
+
   const github = createGitHubPort({
     octokit,
     owner: job.owner,
@@ -307,6 +332,13 @@ async function handleReview(job: ReviewJob): Promise<number> {
       },
       { merge: true },
     );
+
+    if (result.status === "completed") {
+      await recordUsage(job.installationId, tokensUsed).catch((err) => {
+        logError("record usage failed", { jobId: job.jobId, error: (err as Error).message });
+      });
+    }
+
     log("review finished", { jobId: job.jobId, ...result, durationMs: Date.now() - started });
     return 200;
   } catch (err) {
